@@ -6,5 +6,5 @@
   "fqbn": "esp32:esp32:esp32doit-devkit-v1:UploadSpeed=921600,FlashFreq=80,DebugLevel=none,EraseFlash=none",
   "hardwareFolders": "C:\\Users\\OpenTech_PS\\AppData\\Local\\Arduino15\\packages\\esp32\\hardware\\esp32\\3.3.8,C:\\Users\\OpenTech_PS\\AppData\\Local\\Arduino15\\packages\\esp32\\hardware\\esp32\\3.3.8",
   "otherLibrariesFolders": "C:\\Users\\OpenTech_PS\\OneDrive\\Documentos\\Arduino\\libraries",
-  "sketchLocation": "E:\\2TDSPG\\Global Solution\\esp32-webserver-wokwi"
+  "sketchLocation": "E:\\2TDSPG\\Global Solution\\carbontrace-iot"
 }

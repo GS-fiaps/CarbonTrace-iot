@@ -3,84 +3,74 @@
   "author": "CarbonTrace - FIAP Global Solution 2026/1",
   "editor": "wokwi",
   "parts": [
-    {
-      "type": "board-esp32-devkit-v1",
-      "id": "esp",
-      "top": 0,
-      "left": 0,
-      "attrs": {}
-    },
+    { "type": "board-esp32-devkit-v1", "id": "esp", "top": 0, "left": 0, "attrs": {} },
     {
       "type": "wokwi-dht22",
       "id": "dht1",
-      "top": -60,
-      "left": 220,
-      "attrs": { "temperature": "27", "humidity": "68" }
+      "top": -182.1,
+      "left": 109.8,
+      "attrs": { "temperature": "29.9", "humidity": "69" }
     },
     {
       "type": "wokwi-photoresistor-sensor",
       "id": "ldr1",
-      "top": 80,
-      "left": 220,
+      "top": 3.2,
+      "left": -287.2,
       "attrs": { "value": "500" }
     },
     {
       "type": "wokwi-led",
       "id": "led_green",
-      "top": 200,
-      "left": 220,
+      "top": 54,
+      "left": 387.8,
       "attrs": { "color": "green", "label": "SAFE" }
     },
     {
       "type": "wokwi-led",
       "id": "led_red",
-      "top": 200,
-      "left": 270,
+      "top": 44.4,
+      "left": 359,
       "attrs": { "color": "red", "label": "ALERT" }
     },
     {
       "type": "wokwi-resistor",
       "id": "r1",
-      "top": 240,
-      "left": 220,
+      "top": 119.15,
+      "left": 297.6,
       "attrs": { "value": "220" }
     },
     {
       "type": "wokwi-resistor",
       "id": "r2",
-      "top": 240,
-      "left": 270,
+      "top": 99.95,
+      "left": 297.6,
       "attrs": { "value": "220" }
     },
     {
       "type": "wokwi-lcd1602",
       "id": "lcd1",
-      "top": 300,
-      "left": 0,
+      "top": -108.8,
+      "left": 284,
       "attrs": { "pins": "i2c", "address": "0x27" }
     }
   ],
   "connections": [
-    ["esp:3V3",   "dht1:VCC",  "red",    []],
-    ["esp:GND.1", "dht1:GND",  "black",  []],
-    ["dht1:SDA",  "esp:D4",    "green",  []],
-
-    ["esp:3V3",   "ldr1:VCC",  "red",    []],
-    ["esp:GND.1", "ldr1:GND",  "black",  []],
-    ["ldr1:AO",   "esp:D34",   "orange", []],
-
-    ["esp:D18",       "r1:1",        "green", []],
-    ["r1:2",          "led_green:A", "green", []],
-    ["led_green:K",   "esp:GND.2",   "black", []],
-
-    ["esp:D19",     "r2:1",      "red",   []],
-    ["r2:2",        "led_red:A", "red",   []],
-    ["led_red:K",   "esp:GND.2", "black", []],
-
-    ["esp:D21",   "lcd1:SDA", "blue",   []],
-    ["esp:D22",   "lcd1:SCL", "purple", []],
-    ["esp:5V",    "lcd1:VCC", "red",    []],
-    ["esp:GND.1", "lcd1:GND", "black",  []]
+    [ "esp:3V3", "dht1:VCC", "red", [] ],
+    [ "esp:GND.1", "dht1:GND", "black", [] ],
+    [ "ldr1:AO", "esp:D34", "orange", [] ],
+    [ "esp:D18", "r1:1", "green", [] ],
+    [ "r1:2", "led_green:A", "green", [] ],
+    [ "led_green:K", "esp:GND.2", "black", [] ],
+    [ "esp:D19", "r2:1", "red", [] ],
+    [ "r2:2", "led_red:A", "red", [] ],
+    [ "led_red:K", "esp:GND.2", "black", [] ],
+    [ "esp:5V", "lcd1:VCC", "red", [] ],
+    [ "ldr1:VCC", "esp:3V3", "red", [ "h105.6", "v182.4", "h124.8", "v-38.4" ] ],
+    [ "ldr1:GND", "esp:GND.2", "black", [ "h96", "v124.4" ] ],
+    [ "dht1:SDA", "esp:D4", "green", [ "v0" ] ],
+    [ "lcd1:GND", "esp:GND.1", "black", [ "h-19.2", "v220.8", "h-76.8" ] ],
+    [ "esp:D22", "lcd1:SCL", "magenta", [ "h138.71", "v-79.52" ] ],
+    [ "esp:D21", "lcd1:SDA", "blue", [ "h129.11", "v-117.92" ] ]
   ],
   "dependencies": {}
 }
