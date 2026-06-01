@@ -1,60 +1,79 @@
 // ============================================================
-//  CarbonTrace v2.0 — ESP32 IoT Prototype
+//  CarbonTrace v3.0 — Sensor de Qualidade do Ar
 //  FIAP Global Solution 2026/1 | Disruptive Architectures
 //
-//  Entradas : DHT22 (GPIO4) | LDR (GPIO34) | Botão Reset (GPIO14)
-//  Saidas   : LED Verde (GPIO18) | LED Vermelho (GPIO19) | Buzzer (GPIO23)
+//  Sensores:  DHT22  (GPIO4)  — Temperatura e Umidade
+//             MQ-135 (GPIO34) — CO2 / Qualidade do Ar (ADC analógico)
+//             PM2.5  (GPIO35) — Material Particulado  (ADC analógico)
+//  Saidas:    LED Verde (GPIO18) | LED Vermelho (GPIO19) | Buzzer (GPIO23)
+//  Controle:  Botão Reset (GPIO14)
 //  Interface: LCD 16x2 I2C (SDA=21 / SCL=22)
-//  Rede     : Wi-Fi + WebServer porta 80
+//  Rede:      Wi-Fi + WebServer porta 80 + HTTP POST para backend externo
+//
 //  Endpoints:
-//    GET  /api/sensors  — leitura atual
-//    GET  /api/status   — status do dispositivo
-//    GET  /api/carbon   — estimativa de CO2
-//    GET  /api/history  — historico de leituras
-//    POST /api/config   — altera thresholds dinamicamente
-//    GET  /api/docs     — documentacao da API
-//    GET  /dashboard    — painel HTML
+//    GET  /api/sensors     — leitura atual de todos os sensores
+//    GET  /api/status      — status do dispositivo e configurações
+//    GET  /api/air-quality — índice de qualidade do ar e recomendações
+//    GET  /api/history     — histórico de leituras (últimas 10)
+//    POST /api/config      — altera thresholds e URL do backend
+//    GET  /api/docs        — documentação da API (HTML)
+//    GET  /dashboard       — painel HTML em tempo real
+//
+//  Caso de uso: Correlacionar desmatamento com qualidade do ar;
+//               dados complementares ao monitoramento satelital.
 // ============================================================
 
 #include <WiFi.h>
 #include <WebServer.h>
+#include <HTTPClient.h>   // ESP32 Arduino core — client HTTP para backend
 #include <DHT.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <ArduinoJson.h>
 
-// ── Credenciais Wi-Fi ────────────────────────────────────────
+// ── Credenciais Wi-Fi ─────────────────────────────────────────
 const char* SSID     = "Wokwi-GUEST";
 const char* PASSWORD = "";
 
-// ── Pinagem ─────────────────────────────────────────────────
-#define DHT_PIN      4
+// ── Pinagem ──────────────────────────────────────────────────
+#define DHT_PIN      4    // DHT22 — temperatura e umidade
 #define DHT_TYPE     DHT22
-#define LDR_PIN      34
-#define BTN_PIN      14
-#define LED_GREEN    18
-#define LED_RED      19
-#define BUZZER_PIN   23
+#define MQ135_PIN    34   // MQ-135 — CO2 / gases (GPIO input-only, ADC1)
+#define PM25_PIN     35   // PM2.5  — partículas  (GPIO input-only, ADC1)
+#define BTN_PIN      14   // Botão reset de alertas (INPUT_PULLUP)
+#define LED_GREEN    18   // LED status NORMAL / qualidade BOA
+#define LED_RED      19   // LED status ALERTA / qualidade RUIM
+#define BUZZER_PIN   23   // Buzzer sonoro de alerta
 
-// ── Thresholds (alteráveis via POST /api/config) ─────────────
-int   ldrAlertThreshold  = 2500;
-float tempAlertThreshold = 35.0;
+// ── Thresholds de Alerta (configuráveis via POST /api/config) ─
+int   co2AlertThreshold  = 1000;   // ppm   — acima: ar comprometido
+float pm25AlertThreshold = 35.0f;  // µg/m³ — acima: não saudável (EPA)
+float tempAlertThreshold = 40.0f;  // °C    — acima: temperatura crítica
 
-// ── Objetos globais ──────────────────────────────────────────
-DHT dht(DHT_PIN, DHT_TYPE);
+// ── Backend Externo ──────────────────────────────────────────
+// Configurar via POST /api/config com campo "backend_url"
+// Envio automático a cada BACKEND_INTERVAL milissegundos
+String backendUrl = "";
+const  unsigned long BACKEND_INTERVAL = 30000UL; // 30 segundos
+unsigned long lastBackendPost = 0;
+
+// ── Objetos Globais ──────────────────────────────────────────
+DHT               dht(DHT_PIN, DHT_TYPE);
 LiquidCrystal_I2C lcd(0x27, 16, 2);
-WebServer server(80);
+WebServer         server(80);
 
-// ── Estrutura de leitura ─────────────────────────────────────
+// ── Estrutura de Leitura ─────────────────────────────────────
 struct SensorReading {
-  float temperature;
-  float humidity;
-  int   ldrRaw;
-  float coveragePct;
-  float co2Estimate;
-  bool  alert;
-  String status;
-  unsigned long uptimeS;
+  float         temperature;   // °C
+  float         humidity;      // %
+  int           co2Raw;        // ADC bruto (0-4095)
+  float         co2Ppm;        // ppm estimado
+  int           pm25Raw;       // ADC bruto (0-4095)
+  float         pm25UgM3;      // µg/m³ estimado
+  String        airQuality;    // GOOD | MODERATE | UNHEALTHY | HAZARDOUS
+  bool          alert;
+  String        status;        // NORMAL | ALERTA
+  unsigned long uptimeS;       // segundos desde o boot
 };
 
 // Histórico circular (últimas 10 leituras)
@@ -65,29 +84,36 @@ int historyCount = 0;
 SensorReading current;
 unsigned long lastRead    = 0;
 unsigned long startMillis = 0;
-const int READ_INTERVAL   = 5000;
+const int     READ_INTERVAL = 5000; // ms
 
 // Controle do botão
 bool lastBtnState = HIGH;
 
-// Controle do buzzer
+// Controle do buzzer (soa por 1 segundo no alerta)
 unsigned long buzzerStart = 0;
-bool buzzerOn = false;
+bool          buzzerOn    = false;
 
-// ── Protótipos ───────────────────────────────────────────────
+// Warm-up do MQ-135 (~20s para estabilização do elemento sensor)
+bool          mq135Ready  = false;
+unsigned long warmupStart = 0;
+const unsigned long WARMUP_MS = 20000UL;
+
+// ── Protótipos ────────────────────────────────────────────────
 void readSensors();
+float calcCO2Ppm(int raw);
+float calcPM25UgM3(int raw);
+String calcAirQuality(float co2, float pm25);
 void updateLEDs();
 void updateLCD();
 void updateBuzzer();
 void checkButton();
 void resetAlerts();
 void saveToHistory(SensorReading& r);
-float calcCoverage(int ldrRaw);
-float calcCO2(float coveragePct);
+void sendToBackend();
 void handleDashboard();
 void handleSensors();
 void handleStatus();
-void handleCarbon();
+void handleAirQuality();
 void handleHistory();
 void handleConfig();
 void handleDocs();
@@ -110,26 +136,31 @@ void setup() {
   lcd.init();
   lcd.backlight();
   lcd.setCursor(0, 0);
-  lcd.print("CarbonTrace v2.0");
+  lcd.print("CarbonTrace v3.0");
   lcd.setCursor(0, 1);
-  lcd.print("Conectando...");
+  lcd.print("MQ135 warm-up...");
 
-  Serial.println("\n=============================");
-  Serial.println("  CarbonTrace ESP32 v2.0");
-  Serial.println("  FIAP Global Solution 2026");
-  Serial.println("=============================");
+  Serial.println(F("\n=============================="));
+  Serial.println(F("  CarbonTrace ESP32 v3.0"));
+  Serial.println(F("  Sensor de Qualidade do Ar"));
+  Serial.println(F("  FIAP Global Solution 2026"));
+  Serial.println(F("=============================="));
+  Serial.println(F("[MQ-135] Aguardando 20s warm-up..."));
 
+  warmupStart = millis();
+
+  // Conectar ao Wi-Fi
   WiFi.begin(SSID, PASSWORD);
-  Serial.print("Conectando ao Wi-Fi");
+  Serial.print(F("Conectando ao Wi-Fi"));
   int tries = 0;
   while (WiFi.status() != WL_CONNECTED && tries < 20) {
     delay(500);
-    Serial.print(".");
+    Serial.print(F("."));
     tries++;
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWi-Fi conectado!");
+    Serial.println(F("\nWi-Fi conectado!"));
     Serial.println("IP: " + WiFi.localIP().toString());
     lcd.clear();
     lcd.setCursor(0, 0);
@@ -138,34 +169,35 @@ void setup() {
     lcd.print(WiFi.localIP().toString());
     delay(2000);
   } else {
-    Serial.println("\nSem Wi-Fi — modo offline");
+    Serial.println(F("\nSem Wi-Fi - modo offline"));
     lcd.clear();
     lcd.setCursor(0, 0);
     lcd.print("Modo Offline");
+    delay(1000);
   }
 
-  // Rotas
-  server.on("/dashboard",   HTTP_GET,  handleDashboard);
-  server.on("/api/sensors", HTTP_GET,  handleSensors);
-  server.on("/api/status",  HTTP_GET,  handleStatus);
-  server.on("/api/carbon",  HTTP_GET,  handleCarbon);
-  server.on("/api/history", HTTP_GET,  handleHistory);
-  server.on("/api/config",  HTTP_POST, handleConfig);
-  server.on("/api/docs",    HTTP_GET,  handleDocs);
+  // Registrar rotas
+  server.on("/dashboard",       HTTP_GET,  handleDashboard);
+  server.on("/api/sensors",     HTTP_GET,  handleSensors);
+  server.on("/api/status",      HTTP_GET,  handleStatus);
+  server.on("/api/air-quality", HTTP_GET,  handleAirQuality);
+  server.on("/api/history",     HTTP_GET,  handleHistory);
+  server.on("/api/config",      HTTP_POST, handleConfig);
+  server.on("/api/docs",        HTTP_GET,  handleDocs);
   server.onNotFound(handleNotFound);
   server.begin();
 
-  Serial.println("WebServer iniciado na porta 80");
-  Serial.println("-----------------------------");
-  Serial.println("Endpoints disponíveis:");
-  Serial.println("  GET  /dashboard");
-  Serial.println("  GET  /api/sensors");
-  Serial.println("  GET  /api/status");
-  Serial.println("  GET  /api/carbon");
-  Serial.println("  GET  /api/history");
-  Serial.println("  POST /api/config");
-  Serial.println("  GET  /api/docs");
-  Serial.println("-----------------------------");
+  Serial.println(F("WebServer iniciado na porta 80"));
+  Serial.println(F("------------------------------"));
+  Serial.println(F("Endpoints:"));
+  Serial.println(F("  GET  /dashboard"));
+  Serial.println(F("  GET  /api/sensors"));
+  Serial.println(F("  GET  /api/status"));
+  Serial.println(F("  GET  /api/air-quality"));
+  Serial.println(F("  GET  /api/history"));
+  Serial.println(F("  POST /api/config"));
+  Serial.println(F("  GET  /api/docs"));
+  Serial.println(F("------------------------------"));
 
   startMillis = millis();
   readSensors();
@@ -181,6 +213,13 @@ void loop() {
   checkButton();
   updateBuzzer();
 
+  // Verificar warm-up do MQ-135
+  if (!mq135Ready && (millis() - warmupStart >= WARMUP_MS)) {
+    mq135Ready = true;
+    Serial.println(F("[MQ-135] Warm-up concluido - leituras confiaveis."));
+  }
+
+  // Leitura periódica dos sensores
   unsigned long now = millis();
   if (now - lastRead >= READ_INTERVAL) {
     lastRead = now;
@@ -188,36 +227,77 @@ void loop() {
     updateLEDs();
     updateLCD();
 
-    Serial.printf("[%3lus] T=%.1f°C H=%.1f%% LDR=%4d Cob=%.0f%% CO2=%.2ft/ha [%s]\n",
+    Serial.printf(
+      "[%4lus] T=%.1fC  H=%.0f%%  CO2=%.0fppm  PM2.5=%.1fug/m3  [%s | %s]%s\n",
       current.uptimeS,
       current.temperature,
       current.humidity,
-      current.ldrRaw,
-      current.coveragePct,
-      current.co2Estimate,
-      current.status.c_str()
+      current.co2Ppm,
+      current.pm25UgM3,
+      current.status.c_str(),
+      current.airQuality.c_str(),
+      mq135Ready ? "" : " (warm-up)"
     );
+  }
+
+  // Envio periódico ao backend externo
+  if (backendUrl.length() > 0 &&
+      (millis() - lastBackendPost >= BACKEND_INTERVAL)) {
+    lastBackendPost = millis();
+    sendToBackend();
   }
 }
 
 // ════════════════════════════════════════════════════════════
-//  SENSORES
+//  CALCULOS DE SENSORES
+// ════════════════════════════════════════════════════════════
+
+// CO2 em ppm — proxy MQ-135 (ADC 0-4095 -> 400-5000 ppm)
+// Nota: relação real é logarítmica com calibração em gas de referência.
+// Aqui usamos mapeamento linear para simulação (Wokwi / prototipagem).
+float calcCO2Ppm(int raw) {
+  return constrain(400.0f + ((float)raw / 4095.0f) * 4600.0f, 400.0f, 5000.0f);
+}
+
+// PM2.5 em µg/m³ — proxy sensor óptico GP2Y1010 (ADC 0-4095 -> 0-500 µg/m³)
+// Baseado na curva de resposta típica do Sharp GP2Y1010AU0F.
+float calcPM25UgM3(int raw) {
+  return constrain(((float)raw / 4095.0f) * 500.0f, 0.0f, 500.0f);
+}
+
+// Índice de Qualidade do Ar — baseado em PM2.5 e CO2
+// Referência: padrões EPA/CONAMA adaptados para monitoramento IoT
+String calcAirQuality(float co2, float pm25) {
+  if (pm25 > 150.0f || co2 > 2000.0f) return "HAZARDOUS";
+  if (pm25 >  55.0f || co2 > 1500.0f) return "UNHEALTHY";
+  if (pm25 >  35.0f || co2 > 1000.0f) return "MODERATE";
+  return "GOOD";
+}
+
+// ════════════════════════════════════════════════════════════
+//  LEITURA DOS SENSORES
 // ════════════════════════════════════════════════════════════
 void readSensors() {
   float t = dht.readTemperature();
   float h = dht.readHumidity();
+  if (isnan(t)) t = 0.0f;
+  if (isnan(h)) h = 0.0f;
 
-  if (isnan(t)) t = 0.0;
-  if (isnan(h)) h = 0.0;
+  int    co2Raw  = analogRead(MQ135_PIN);
+  int    pm25Raw = analogRead(PM25_PIN);
+  float  co2Ppm  = calcCO2Ppm(co2Raw);
+  float  pm25    = calcPM25UgM3(pm25Raw);
+  String aq      = calcAirQuality(co2Ppm, pm25);
 
-  int   ldr      = analogRead(LDR_PIN);
-  float coverage = calcCoverage(ldr);
-  float co2      = calcCO2(coverage);
-  bool  alert    = (ldr > ldrAlertThreshold || t > tempAlertThreshold);
-  String status  = alert ? "ALERTA" : "NORMAL";
+  bool alert = (co2Ppm > (float)co2AlertThreshold ||
+                pm25   > pm25AlertThreshold        ||
+                t      > tempAlertThreshold);
+
   unsigned long uptime = (millis() - startMillis) / 1000;
 
-  current = { t, h, ldr, coverage, co2, alert, status, uptime };
+  current = { t, h, co2Raw, co2Ppm, pm25Raw, pm25,
+              aq, alert, (alert ? "ALERTA" : "NORMAL"), uptime };
+
   saveToHistory(current);
 
   if (alert && !buzzerOn) {
@@ -227,15 +307,6 @@ void readSensors() {
   }
 }
 
-float calcCoverage(int ldrRaw) {
-  float pct = 100.0 - ((float)ldrRaw / 4095.0 * 100.0);
-  return constrain(pct, 0.0, 100.0);
-}
-
-float calcCO2(float coveragePct) {
-  return (1.0 - coveragePct / 100.0) * 150.0;
-}
-
 void saveToHistory(SensorReading& r) {
   history[historyIndex] = r;
   historyIndex = (historyIndex + 1) % 10;
@@ -243,15 +314,53 @@ void saveToHistory(SensorReading& r) {
 }
 
 // ════════════════════════════════════════════════════════════
+//  ENVIO PARA BACKEND EXTERNO
+// ════════════════════════════════════════════════════════════
+void sendToBackend() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  if (!http.begin(backendUrl)) {
+    Serial.println("[BACKEND] Falha ao iniciar: " + backendUrl);
+    return;
+  }
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(5000);
+
+  // Payload com todos os dados de qualidade do ar
+  StaticJsonDocument<384> doc;
+  doc["device"]      = "CarbonTrace-ESP32";
+  doc["timestamp_s"] = current.uptimeS;
+  doc["temperature"] = serialized(String(current.temperature, 1));
+  doc["humidity"]    = serialized(String(current.humidity,    1));
+  doc["co2_ppm"]     = serialized(String(current.co2Ppm,      0));
+  doc["pm25_ug_m3"]  = serialized(String(current.pm25UgM3,    1));
+  doc["air_quality"] = current.airQuality;
+  doc["alert"]       = current.alert;
+  doc["status"]      = current.status;
+
+  String payload;
+  serializeJson(doc, payload);
+
+  int code = http.POST(payload);
+  if (code > 0) {
+    Serial.printf("[BACKEND] POST %d -> %s\n", code, backendUrl.c_str());
+  } else {
+    Serial.printf("[BACKEND] Erro: %s\n", http.errorToString(code).c_str());
+  }
+  http.end();
+}
+
+// ════════════════════════════════════════════════════════════
 //  ATUADORES
 // ════════════════════════════════════════════════════════════
 void updateLEDs() {
-  digitalWrite(LED_GREEN, !current.alert ? HIGH : LOW);
-  digitalWrite(LED_RED,    current.alert ? HIGH : LOW);
+  digitalWrite(LED_GREEN, current.alert ? LOW  : HIGH);
+  digitalWrite(LED_RED,   current.alert ? HIGH : LOW);
 }
 
 void updateBuzzer() {
-  if (buzzerOn && millis() - buzzerStart >= 1000) {
+  if (buzzerOn && (millis() - buzzerStart >= 1000)) {
     buzzerOn = false;
     digitalWrite(BUZZER_PIN, LOW);
   }
@@ -260,40 +369,37 @@ void updateBuzzer() {
 void updateLCD() {
   lcd.clear();
 
+  // Linha 0: Temperatura e Umidade
   char line0[17];
-  snprintf(line0, sizeof(line0), "T:%.1fC H:%.0f%%",
+  snprintf(line0, sizeof(line0), "T:%.1fC  H:%.0f%%",
     current.temperature, current.humidity);
   lcd.setCursor(0, 0);
   lcd.print(line0);
 
+  // Linha 1: CO2 (ppm) e PM2.5 (ug/m3)
   char line1[17];
-  snprintf(line1, sizeof(line1), "Cob:%.0f%% %s",
-    current.coveragePct,
-    current.alert ? "!ALERT" : "OK    ");
+  snprintf(line1, sizeof(line1), "CO2:%.0f PM:%.0f",
+    current.co2Ppm, current.pm25UgM3);
   lcd.setCursor(0, 1);
   lcd.print(line1);
 }
 
 // ════════════════════════════════════════════════════════════
-//  BOTÃO DE RESET
+//  BOTAO DE RESET
 // ════════════════════════════════════════════════════════════
 void checkButton() {
-  bool btnState = digitalRead(BTN_PIN);
-  if (btnState == LOW && lastBtnState == HIGH) {
+  bool state = digitalRead(BTN_PIN);
+  if (state == LOW && lastBtnState == HIGH) {
     delay(50);
-    if (digitalRead(BTN_PIN) == LOW) {
-      resetAlerts();
-    }
+    if (digitalRead(BTN_PIN) == LOW) resetAlerts();
   }
-  lastBtnState = btnState;
+  lastBtnState = state;
 }
 
 void resetAlerts() {
-  Serial.println("[BTN] Reset de alertas acionado!");
-
+  Serial.println(F("[BTN] Reset de alertas acionado!"));
   historyIndex = 0;
   historyCount = 0;
-
   digitalWrite(LED_RED,    LOW);
   digitalWrite(LED_GREEN,  HIGH);
   digitalWrite(BUZZER_PIN, LOW);
@@ -312,22 +418,23 @@ void resetAlerts() {
 }
 
 // ════════════════════════════════════════════════════════════
-//  ENDPOINTS DA API
+//  API — GET /api/sensors
 // ════════════════════════════════════════════════════════════
-
-// GET /api/sensors
 void handleSensors() {
-  StaticJsonDocument<256> doc;
-  doc["temperature"]  = serialized(String(current.temperature, 1));
-  doc["humidity"]     = serialized(String(current.humidity, 1));
-  doc["ldr_raw"]      = current.ldrRaw;
-  doc["coverage_pct"] = serialized(String(current.coveragePct, 1));
-  doc["co2_ton_ha"]   = serialized(String(current.co2Estimate, 2));
-  doc["alert"]        = current.alert;
-  doc["status"]       = current.status;
-  doc["led_green"]    = !current.alert;
-  doc["led_red"]      = current.alert;
-  doc["uptime_s"]     = current.uptimeS;
+  StaticJsonDocument<384> doc;
+  doc["temperature"] = serialized(String(current.temperature, 1));
+  doc["humidity"]    = serialized(String(current.humidity,    1));
+  doc["co2_raw"]     = current.co2Raw;
+  doc["co2_ppm"]     = serialized(String(current.co2Ppm,      0));
+  doc["pm25_raw"]    = current.pm25Raw;
+  doc["pm25_ug_m3"]  = serialized(String(current.pm25UgM3,    1));
+  doc["air_quality"] = current.airQuality;
+  doc["alert"]       = current.alert;
+  doc["status"]      = current.status;
+  doc["led_green"]   = !current.alert;
+  doc["led_red"]     = current.alert;
+  doc["mq135_ready"] = mq135Ready;
+  doc["uptime_s"]    = current.uptimeS;
 
   String out;
   serializeJson(doc, out);
@@ -335,18 +442,23 @@ void handleSensors() {
   server.send(200, "application/json", out);
 }
 
-// GET /api/status
+// ════════════════════════════════════════════════════════════
+//  API — GET /api/status
+// ════════════════════════════════════════════════════════════
 void handleStatus() {
   StaticJsonDocument<512> doc;
-  doc["device"]           = "CarbonTrace-ESP32";
-  doc["firmware"]         = "2.0.0";
-  doc["wifi_ssid"]        = SSID;
-  doc["ip"]               = WiFi.localIP().toString();
-  doc["uptime_s"]         = (millis() - startMillis) / 1000;
-  doc["alert"]            = current.alert;
-  doc["ldr_threshold"]    = ldrAlertThreshold;
-  doc["temp_threshold_c"] = tempAlertThreshold;
-  doc["history_count"]    = historyCount;
+  doc["device"]              = "CarbonTrace-ESP32";
+  doc["firmware"]            = "3.0.0";
+  doc["wifi_ssid"]           = SSID;
+  doc["ip"]                  = WiFi.localIP().toString();
+  doc["uptime_s"]            = (millis() - startMillis) / 1000;
+  doc["alert"]               = current.alert;
+  doc["mq135_ready"]         = mq135Ready;
+  doc["co2_threshold_ppm"]   = co2AlertThreshold;
+  doc["pm25_threshold_ugm3"] = pm25AlertThreshold;
+  doc["temp_threshold_c"]    = tempAlertThreshold;
+  doc["backend_url"]         = (backendUrl.length() > 0) ? backendUrl : "(nao configurado)";
+  doc["history_count"]       = historyCount;
 
   String out;
   serializeJson(doc, out);
@@ -354,21 +466,45 @@ void handleStatus() {
   server.send(200, "application/json", out);
 }
 
-// GET /api/carbon
-void handleCarbon() {
-  StaticJsonDocument<256> doc;
+// ════════════════════════════════════════════════════════════
+//  API — GET /api/air-quality
+// ════════════════════════════════════════════════════════════
+void handleAirQuality() {
+  const char* desc;
+  const char* recommendation;
+  const char* color;
 
-  String riskLevel;
-  if      (current.coveragePct >= 70) riskLevel = "LOW";
-  else if (current.coveragePct >= 40) riskLevel = "MEDIUM";
-  else                                 riskLevel = "HIGH";
+  if (current.airQuality == "GOOD") {
+    desc           = "Qualidade do ar excelente";
+    recommendation = "Nenhuma restricao. Atividades ao ar livre recomendadas.";
+    color          = "#34d399";
+  } else if (current.airQuality == "MODERATE") {
+    desc           = "Qualidade do ar moderada";
+    recommendation = "Grupos sensiveis devem reduzir exposicao prolongada.";
+    color          = "#fbbf24";
+  } else if (current.airQuality == "UNHEALTHY") {
+    desc           = "Qualidade do ar nao saudavel";
+    recommendation = "Evitar atividades ao ar livre. Considere usar mascara.";
+    color          = "#f97316";
+  } else {
+    desc           = "Qualidade do ar perigosa";
+    recommendation = "Emergencia ambiental. Permanecer em ambientes fechados.";
+    color          = "#ef4444";
+  }
 
-  doc["coverage_pct"]         = serialized(String(current.coveragePct, 1));
-  doc["estimated_co2_ton_ha"] = serialized(String(current.co2Estimate, 2));
-  doc["risk_level"]           = riskLevel;
-  doc["ldr_raw"]              = current.ldrRaw;
-  doc["threshold_pct"]        = 70;
-  doc["description"]          = "Estimativa baseada em LDR como proxy de cobertura vegetal";
+  StaticJsonDocument<512> doc;
+  doc["air_quality"]          = current.airQuality;
+  doc["color_hex"]            = color;
+  doc["co2_ppm"]              = serialized(String(current.co2Ppm,      0));
+  doc["pm25_ug_m3"]           = serialized(String(current.pm25UgM3,    1));
+  doc["temperature_c"]        = serialized(String(current.temperature, 1));
+  doc["humidity_pct"]         = serialized(String(current.humidity,    1));
+  doc["alert"]                = current.alert;
+  doc["description"]          = desc;
+  doc["recommendation"]       = recommendation;
+  doc["co2_threshold_ppm"]    = co2AlertThreshold;
+  doc["pm25_threshold_ugm3"]  = pm25AlertThreshold;
+  doc["mq135_ready"]          = mq135Ready;
 
   String out;
   serializeJson(doc, out);
@@ -376,24 +512,27 @@ void handleCarbon() {
   server.send(200, "application/json", out);
 }
 
-// GET /api/history
+// ════════════════════════════════════════════════════════════
+//  API — GET /api/history
+// ════════════════════════════════════════════════════════════
 void handleHistory() {
   StaticJsonDocument<1024> doc;
   doc["total_records"] = historyCount;
 
   JsonArray hist = doc.createNestedArray("readings");
   int start = (historyCount < 10) ? 0 : historyIndex;
+
   for (int i = 0; i < historyCount; i++) {
     int idx = (start + i) % 10;
     JsonObject entry = hist.createNestedObject();
-    entry["uptime_s"] = history[idx].uptimeS;
-    entry["temp"]     = serialized(String(history[idx].temperature, 1));
-    entry["humidity"] = serialized(String(history[idx].humidity, 1));
-    entry["ldr"]      = history[idx].ldrRaw;
-    entry["coverage"] = serialized(String(history[idx].coveragePct, 1));
-    entry["co2"]      = serialized(String(history[idx].co2Estimate, 2));
-    entry["status"]   = history[idx].status;
-    entry["alert"]    = history[idx].alert;
+    entry["uptime_s"]    = history[idx].uptimeS;
+    entry["temp"]        = serialized(String(history[idx].temperature, 1));
+    entry["humidity"]    = serialized(String(history[idx].humidity,    1));
+    entry["co2_ppm"]     = serialized(String(history[idx].co2Ppm,      0));
+    entry["pm25_ug_m3"]  = serialized(String(history[idx].pm25UgM3,    1));
+    entry["air_quality"] = history[idx].airQuality;
+    entry["status"]      = history[idx].status;
+    entry["alert"]       = history[idx].alert;
   }
 
   String out;
@@ -402,42 +541,42 @@ void handleHistory() {
   server.send(200, "application/json", out);
 }
 
-// POST /api/config
+// ════════════════════════════════════════════════════════════
+//  API — POST /api/config
+// ════════════════════════════════════════════════════════════
 void handleConfig() {
   if (!server.hasArg("plain")) {
     server.send(400, "application/json", "{\"error\":\"Body JSON obrigatorio\"}");
     return;
   }
 
-  StaticJsonDocument<128> req;
-  DeserializationError err = deserializeJson(req, server.arg("plain"));
-  if (err) {
+  StaticJsonDocument<256> req;
+  if (deserializeJson(req, server.arg("plain"))) {
     server.send(400, "application/json", "{\"error\":\"JSON invalido\"}");
     return;
   }
 
   bool changed = false;
-  if (req.containsKey("ldr_threshold")) {
-    ldrAlertThreshold = req["ldr_threshold"].as<int>();
-    changed = true;
-  }
-  if (req.containsKey("temp_threshold")) {
-    tempAlertThreshold = req["temp_threshold"].as<float>();
-    changed = true;
-  }
+  if (req.containsKey("co2_threshold"))  { co2AlertThreshold  = req["co2_threshold"].as<int>();   changed = true; }
+  if (req.containsKey("pm25_threshold")) { pm25AlertThreshold = req["pm25_threshold"].as<float>(); changed = true; }
+  if (req.containsKey("temp_threshold")) { tempAlertThreshold = req["temp_threshold"].as<float>(); changed = true; }
+  if (req.containsKey("backend_url"))    { backendUrl = req["backend_url"].as<String>();           changed = true; }
 
   if (!changed) {
-    server.send(400, "application/json", "{\"error\":\"Nenhum campo valido enviado\"}");
+    server.send(400, "application/json", "{\"error\":\"Nenhum campo valido\"}");
     return;
   }
 
-  Serial.printf("[CONFIG] Novo threshold LDR=%d | Temp=%.1f\n",
-    ldrAlertThreshold, tempAlertThreshold);
+  Serial.printf("[CONFIG] CO2=%dppm | PM25=%.1f ug/m3 | Temp=%.1fC | Backend=%s\n",
+    co2AlertThreshold, pm25AlertThreshold, tempAlertThreshold,
+    backendUrl.length() ? backendUrl.c_str() : "(desativado)");
 
-  StaticJsonDocument<128> res;
-  res["message"]        = "Configuracao atualizada";
-  res["ldr_threshold"]  = ldrAlertThreshold;
-  res["temp_threshold"] = tempAlertThreshold;
+  StaticJsonDocument<256> res;
+  res["message"]             = "Configuracao atualizada";
+  res["co2_threshold_ppm"]   = co2AlertThreshold;
+  res["pm25_threshold_ugm3"] = pm25AlertThreshold;
+  res["temp_threshold_c"]    = tempAlertThreshold;
+  res["backend_url"]         = (backendUrl.length() > 0) ? backendUrl : "(desativado)";
 
   String out;
   serializeJson(res, out);
@@ -445,336 +584,361 @@ void handleConfig() {
   server.send(200, "application/json", out);
 }
 
-// GET /api/docs
+// ════════════════════════════════════════════════════════════
+//  GET /api/docs
+// ════════════════════════════════════════════════════════════
 void handleDocs() {
   String html = R"rawhtml(
-<!DOCTYPE html>
-<html lang="pt-BR">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<!DOCTYPE html><html lang="pt-BR"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>CarbonTrace API Docs</title>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
-  body{font-family:system-ui,sans-serif;background:#0f1117;color:#e2e8f0;padding:24px;max-width:800px;margin:0 auto}
+  body{font-family:system-ui,sans-serif;background:#0f1117;color:#e2e8f0;padding:24px;max-width:820px;margin:0 auto}
   h1{font-size:22px;font-weight:600;color:#fff;margin-bottom:4px}
-  .version{font-size:12px;color:#64748b;margin-bottom:32px}
-  .endpoint{background:#1e2130;border:1px solid #2d3748;border-radius:12px;padding:20px;margin-bottom:16px}
-  .method-row{display:flex;align-items:center;gap:12px;margin-bottom:10px}
-  .method{padding:3px 10px;border-radius:6px;font-size:12px;font-weight:700;font-family:monospace}
-  .get{background:#1e3a5f;color:#60a5fa}
-  .post{background:#3b1f00;color:#fb923c}
+  .sub{font-size:12px;color:#64748b;margin-bottom:32px}
+  .ep{background:#1e2130;border:1px solid #2d3748;border-radius:12px;padding:20px;margin-bottom:16px}
+  .row{display:flex;align-items:center;gap:12px;margin-bottom:10px}
+  .m{padding:3px 10px;border-radius:6px;font-size:12px;font-weight:700;font-family:monospace}
+  .get{background:#1e3a5f;color:#60a5fa}.post{background:#3b1f00;color:#fb923c}
   .path{font-family:monospace;font-size:15px;font-weight:600;color:#fff}
   .desc{font-size:13px;color:#94a3b8;margin-bottom:12px}
-  .label{font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px}
+  .lbl{font-size:11px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px}
   pre{background:#0f1117;border:1px solid #2d3748;border-radius:8px;padding:12px;font-size:12px;color:#86efac;overflow-x:auto;white-space:pre-wrap}
   .back{display:inline-block;margin-bottom:24px;color:#60a5fa;font-size:13px;text-decoration:none}
   .note{font-size:12px;color:#fb923c;background:#3b1f0033;border:1px solid #fb923c44;border-radius:8px;padding:10px 14px;margin-top:10px}
-</style>
-</head>
-<body>
-<a class="back" href="/dashboard">← voltar ao dashboard</a>
-<h1>🌿 CarbonTrace API</h1>
-<p class="version">ESP32 WebServer · v2.0.0 · FIAP Global Solution 2026/1</p>
+  .tag{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;margin-right:4px;margin-bottom:4px}
+  .tg{background:#065f46;color:#34d399}.tm{background:#78350f;color:#fbbf24}
+  .tu{background:#7c2d12;color:#f97316}.th{background:#7f1d1d;color:#ef4444}
+</style></head><body>
+<a class="back" href="/dashboard">&#8592; voltar ao dashboard</a>
+<h1>&#127788; CarbonTrace API — Qualidade do Ar</h1>
+<p class="sub">ESP32 WebServer · v3.0.0 · MQ-135 + DHT22 + PM2.5 · FIAP Global Solution 2026/1</p>
 
-<div class="endpoint">
-  <div class="method-row"><span class="method get">GET</span><span class="path">/api/sensors</span></div>
-  <p class="desc">Leitura atual de todos os sensores e estado dos atuadores.</p>
-  <div class="label">Resposta</div>
-  <pre>{
-  "temperature": "27.4",
-  "humidity": "68.2",
-  "ldr_raw": 1820,
-  "coverage_pct": "55.6",
-  "co2_ton_ha": "66.60",
-  "alert": false,
-  "status": "NORMAL",
-  "led_green": true,
-  "led_red": false,
-  "uptime_s": 120
-}</pre>
+<div style="margin-bottom:20px">
+  <span class="tag tg">GOOD</span>
+  <span class="tag tm">MODERATE</span>
+  <span class="tag tu">UNHEALTHY</span>
+  <span class="tag th">HAZARDOUS</span>
+  <span style="font-size:12px;color:#64748b">— níveis de qualidade do ar</span>
 </div>
 
-<div class="endpoint">
-  <div class="method-row"><span class="method get">GET</span><span class="path">/api/status</span></div>
-  <p class="desc">Status do dispositivo e configurações ativas.</p>
-  <div class="label">Resposta</div>
-  <pre>{
-  "device": "CarbonTrace-ESP32",
-  "firmware": "2.0.0",
-  "ip": "10.10.0.2",
-  "uptime_s": 120,
-  "alert": false,
-  "ldr_threshold": 2500,
-  "temp_threshold_c": 35.0,
-  "history_count": 5
-}</pre>
+<div class="ep">
+  <div class="row"><span class="m get">GET</span><span class="path">/api/sensors</span></div>
+  <p class="desc">Leitura atual de todos os sensores: temperatura, umidade, CO2 (ppm), PM2.5 (µg/m³), qualidade do ar e estado dos atuadores.</p>
+  <div class="lbl">Resposta</div>
+  <pre>{ "temperature":"27.5","humidity":"72.0","co2_raw":410,"co2_ppm":"861",
+  "pm25_raw":328,"pm25_ug_m3":"40.0","air_quality":"MODERATE",
+  "alert":false,"status":"NORMAL","led_green":true,"led_red":false,
+  "mq135_ready":true,"uptime_s":120 }</pre>
 </div>
 
-<div class="endpoint">
-  <div class="method-row"><span class="method get">GET</span><span class="path">/api/carbon</span></div>
-  <p class="desc">Estimativa de emissão de carbono baseada na cobertura vegetal.</p>
-  <div class="label">Resposta</div>
-  <pre>{
-  "coverage_pct": "55.6",
-  "estimated_co2_ton_ha": "66.60",
-  "risk_level": "MEDIUM",
-  "ldr_raw": 1820,
-  "threshold_pct": 70,
-  "description": "Estimativa baseada em LDR como proxy de cobertura vegetal"
-}</pre>
+<div class="ep">
+  <div class="row"><span class="m get">GET</span><span class="path">/api/air-quality</span></div>
+  <p class="desc">Índice de qualidade do ar com descrição e recomendações para a população.</p>
+  <div class="lbl">Resposta</div>
+  <pre>{ "air_quality":"MODERATE","color_hex":"#fbbf24",
+  "co2_ppm":"861","pm25_ug_m3":"40.0","temperature_c":"27.5","humidity_pct":"72.0",
+  "alert":false,"description":"Qualidade do ar moderada",
+  "recommendation":"Grupos sensiveis devem reduzir exposicao prolongada.",
+  "co2_threshold_ppm":1000,"pm25_threshold_ugm3":35.0,"mq135_ready":true }</pre>
 </div>
 
-<div class="endpoint">
-  <div class="method-row"><span class="method get">GET</span><span class="path">/api/history</span></div>
-  <p class="desc">Últimas 10 leituras armazenadas em memória com timestamp de uptime.</p>
-  <div class="label">Resposta</div>
-  <pre>{
-  "total_records": 3,
-  "readings": [
-    { "uptime_s": 5, "temp": "27.4", "humidity": "68.0",
-      "ldr": 1820, "coverage": "55.5", "co2": "66.75",
-      "status": "NORMAL", "alert": false }
-  ]
-}</pre>
+<div class="ep">
+  <div class="row"><span class="m get">GET</span><span class="path">/api/status</span></div>
+  <p class="desc">Status do dispositivo, thresholds ativos, backend configurado e contagem do histórico.</p>
+  <div class="lbl">Resposta</div>
+  <pre>{ "device":"CarbonTrace-ESP32","firmware":"3.0.0","ip":"10.10.0.2",
+  "uptime_s":120,"alert":false,"mq135_ready":true,
+  "co2_threshold_ppm":1000,"pm25_threshold_ugm3":35.0,"temp_threshold_c":40.0,
+  "backend_url":"(nao configurado)","history_count":5 }</pre>
 </div>
 
-<div class="endpoint">
-  <div class="method-row"><span class="method post">POST</span><span class="path">/api/config</span></div>
-  <p class="desc">Altera os thresholds de alerta em tempo real sem reiniciar o dispositivo.</p>
-  <div class="label">Body (JSON)</div>
-  <pre>{
-  "ldr_threshold": 2000,
-  "temp_threshold": 32.0
-}</pre>
-  <div class="label" style="margin-top:12px">Resposta</div>
-  <pre>{
-  "message": "Configuracao atualizada",
-  "ldr_threshold": 2000,
-  "temp_threshold": 32.0
-}</pre>
-  <div class="note">Envie ao menos um dos campos. Ambos são opcionais individualmente.</div>
+<div class="ep">
+  <div class="row"><span class="m get">GET</span><span class="path">/api/history</span></div>
+  <p class="desc">Últimas 10 leituras armazenadas em buffer circular, com timestamp de uptime.</p>
+  <div class="lbl">Resposta</div>
+  <pre>{ "total_records":3,
+  "readings":[
+    { "uptime_s":5,"temp":"27.5","humidity":"72.0","co2_ppm":"861",
+      "pm25_ug_m3":"40.0","air_quality":"MODERATE","status":"NORMAL","alert":false }
+  ]}</pre>
 </div>
 
-</body>
-</html>
-)rawhtml";
+<div class="ep">
+  <div class="row"><span class="m post">POST</span><span class="path">/api/config</span></div>
+  <p class="desc">Altera thresholds de alerta e URL do backend em tempo real, sem reiniciar o dispositivo.</p>
+  <div class="lbl">Body (JSON) — todos os campos são opcionais individualmente</div>
+  <pre>{ "co2_threshold": 800,
+  "pm25_threshold": 25.0,
+  "temp_threshold": 38.0,
+  "backend_url": "http://meu-servidor.com/api/iot/data" }</pre>
+  <div class="lbl" style="margin-top:12px">Resposta</div>
+  <pre>{ "message":"Configuracao atualizada",
+  "co2_threshold_ppm":800,"pm25_threshold_ugm3":25.0,
+  "temp_threshold_c":38.0,"backend_url":"http://meu-servidor.com/api/iot/data" }</pre>
+  <div class="note">Após configurar backend_url, o ESP32 fará POST automático a cada 30 s com todos os dados dos sensores.</div>
+</div>
+
+</body></html>)rawhtml";
 
   server.send(200, "text/html", html);
 }
 
-// GET /dashboard
+// ════════════════════════════════════════════════════════════
+//  GET /dashboard
+// ════════════════════════════════════════════════════════════
 void handleDashboard() {
   String html = R"rawhtml(
-<!DOCTYPE html>
-<html lang="pt-BR">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CarbonTrace Dashboard</title>
+<!DOCTYPE html><html lang="pt-BR"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CarbonTrace — Qualidade do Ar</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
   body{font-family:system-ui,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh;padding:20px}
   h1{font-size:22px;font-weight:600;margin-bottom:4px;color:#fff}
-  .sub{font-size:13px;color:#64748b;margin-bottom:24px}
-  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:24px}
-  .card{background:#1e2130;border-radius:12px;padding:16px;border:1px solid #2d3748;transition:border-color .3s}
-  .card.alert{border-color:#f87171}
-  .card.ok{border-color:#34d399}
-  .label{font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px}
-  .value{font-size:28px;font-weight:600;color:#fff}
+  .sub{font-size:13px;color:#64748b;margin-bottom:20px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:24px}
+  .card{background:#1e2130;border-radius:12px;padding:16px;border:1px solid #2d3748;transition:border-color .3s,background .3s}
+  .card.alert{border-color:#ef4444}.card.ok{border-color:#34d399}
+  .card.aqi-good{border-color:#34d399;background:#041f0e}
+  .card.aqi-moderate{border-color:#fbbf24;background:#1c1500}
+  .card.aqi-unhealthy{border-color:#f97316;background:#1c0d00}
+  .card.aqi-hazardous{border-color:#ef4444;background:#1c0000}
+  .lbl{font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px}
+  .val{font-size:28px;font-weight:600;color:#fff}
   .unit{font-size:13px;color:#94a3b8;margin-left:2px}
-  .badge{display:inline-block;padding:3px 10px;border-radius:20px;font-size:12px;font-weight:600;margin-top:8px}
+  .badge{display:inline-block;padding:3px 10px;border-radius:20px;font-size:12px;font-weight:700;margin-top:6px}
+  .badge.GOOD{background:#065f46;color:#34d399}
+  .badge.MODERATE{background:#78350f;color:#fbbf24}
+  .badge.UNHEALTHY{background:#7c2d12;color:#f97316}
+  .badge.HAZARDOUS{background:#7f1d1d;color:#ef4444}
   .badge.NORMAL{background:#064e3b;color:#34d399}
   .badge.ALERTA{background:#450a0a;color:#f87171}
-  .chart-wrap{background:#1e2130;border-radius:12px;padding:16px;border:1px solid #2d3748;margin-bottom:16px}
-  .chart-title{font-size:13px;color:#94a3b8;margin-bottom:12px;font-weight:500}
-  canvas{max-height:180px}
+  .aqi-main{font-size:22px;font-weight:700;margin-top:4px}
+  .aqi-tip{font-size:11px;color:#64748b;margin-top:6px;line-height:1.4}
+  .chart-wrap{background:#1e2130;border-radius:12px;padding:16px;border:1px solid #2d3748;margin-bottom:14px}
+  .ctitle{font-size:13px;color:#94a3b8;margin-bottom:12px;font-weight:500}
+  canvas{max-height:175px}
   .led-row{display:flex;gap:12px;margin-top:8px;align-items:center}
   .led{width:14px;height:14px;border-radius:50%;background:#334155;transition:all .3s}
   .led.on-green{background:#34d399;box-shadow:0 0 8px #34d39988}
-  .led.on-red{background:#f87171;box-shadow:0 0 8px #f8717188}
-  .led-label{font-size:11px;color:#64748b}
-  .config-wrap{background:#1e2130;border-radius:12px;padding:16px;border:1px solid #2d3748;margin-bottom:16px}
-  .config-title{font-size:13px;color:#94a3b8;margin-bottom:14px;font-weight:500}
-  .config-row{display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap}
-  .config-field{display:flex;flex-direction:column;gap:4px;flex:1;min-width:140px}
-  .config-field label{font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:.05em}
-  .config-field input{background:#0f1117;border:1px solid #2d3748;color:#e2e8f0;padding:8px 10px;border-radius:8px;font-size:13px;outline:none}
-  .config-field input:focus{border-color:#60a5fa}
-  .btn{padding:8px 18px;border-radius:8px;border:none;background:#1e3a5f;color:#60a5fa;font-size:13px;font-weight:600;cursor:pointer}
+  .led.on-red{background:#ef4444;box-shadow:0 0 8px #ef444488}
+  .led-lbl{font-size:11px;color:#64748b}
+  .warmup{background:#1c1400;border:1px solid #92400e;border-radius:8px;padding:8px 14px;
+    font-size:12px;color:#fbbf24;margin-bottom:16px;display:none}
+  .cfg-wrap{background:#1e2130;border-radius:12px;padding:16px;border:1px solid #2d3748;margin-bottom:16px}
+  .cfg-title{font-size:13px;color:#94a3b8;margin-bottom:14px;font-weight:500}
+  .cfg-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:12px;align-items:end}
+  .fld{display:flex;flex-direction:column;gap:4px}
+  .fld label{font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:.05em}
+  .fld input{background:#0f1117;border:1px solid #2d3748;color:#e2e8f0;padding:8px 10px;
+    border-radius:8px;font-size:13px;outline:none;width:100%}
+  .fld input:focus{border-color:#60a5fa}
+  .fld.wide{grid-column:1/-1}
+  .btn{padding:9px 20px;border-radius:8px;border:none;background:#1e3a5f;
+    color:#60a5fa;font-size:13px;font-weight:600;cursor:pointer;align-self:end}
   .btn:hover{background:#2a4a7f}
+  .ref{font-size:11px;color:#475569;margin-top:10px;line-height:1.6}
   .msg{font-size:12px;margin-top:8px;color:#34d399;min-height:16px}
-  .nav{display:flex;gap:12px;margin-bottom:20px;flex-wrap:wrap}
-  .nav a{font-size:13px;color:#60a5fa;text-decoration:none;padding:6px 14px;border:1px solid #1e3a5f;border-radius:8px}
+  .nav{display:flex;gap:10px;margin-bottom:20px;flex-wrap:wrap}
+  .nav a{font-size:13px;color:#60a5fa;text-decoration:none;padding:6px 14px;
+    border:1px solid #1e3a5f;border-radius:8px}
   .nav a:hover{background:#1e3a5f}
   footer{font-size:11px;color:#334155;text-align:center;margin-top:24px}
 </style>
-</head>
-<body>
-<h1>🌿 CarbonTrace Dashboard</h1>
-<p class="sub">ESP32 IoT · FIAP Global Solution 2026/1 · atualiza a cada 5s</p>
+</head><body>
+<h1>&#127788; CarbonTrace — Qualidade do Ar</h1>
+<p class="sub">ESP32 · MQ-135 + DHT22 + PM2.5 · FIAP Global Solution 2026/1 · atualiza a cada 5s</p>
+
+<div id="warmup-banner" class="warmup">
+  &#9888;&#65039; MQ-135 em warm-up (20s) — leituras iniciais podem ser imprecisas.
+</div>
 
 <div class="nav">
-  <a href="/api/docs">📄 API Docs</a>
-  <a href="/api/sensors" target="_blank">⚡ /api/sensors</a>
-  <a href="/api/history" target="_blank">📋 /api/history</a>
-  <a href="/api/carbon"  target="_blank">🌱 /api/carbon</a>
+  <a href="/api/docs">&#128196; Docs</a>
+  <a href="/api/sensors" target="_blank">&#9889; /sensors</a>
+  <a href="/api/air-quality" target="_blank">&#127788; /air-quality</a>
+  <a href="/api/history" target="_blank">&#128203; /history</a>
 </div>
 
 <div class="grid">
-  <div class="card"><div class="label">Temperatura</div><div class="value" id="temp">--<span class="unit">°C</span></div></div>
-  <div class="card"><div class="label">Umidade</div><div class="value" id="hum">--<span class="unit">%</span></div></div>
-  <div class="card"><div class="label">LDR (bruto)</div><div class="value" id="ldr">--</div></div>
-  <div class="card"><div class="label">Cobertura vegetal</div><div class="value" id="cov">--<span class="unit">%</span></div></div>
-  <div class="card"><div class="label">CO₂ estimado</div><div class="value" id="co2">--<span class="unit">t/ha</span></div></div>
+  <div class="card" id="aqi-card">
+    <div class="lbl">Qualidade do Ar (IQA)</div>
+    <div class="aqi-main" id="aqi-val">--</div>
+    <div id="aqi-badge"></div>
+    <div class="aqi-tip" id="aqi-tip">--</div>
+  </div>
+  <div class="card">
+    <div class="lbl">CO&#8322; estimado (MQ-135)</div>
+    <div class="val" id="co2">--<span class="unit">ppm</span></div>
+  </div>
+  <div class="card">
+    <div class="lbl">PM2.5</div>
+    <div class="val" id="pm25">--<span class="unit">&#956;g/m&#179;</span></div>
+  </div>
+  <div class="card">
+    <div class="lbl">Temperatura</div>
+    <div class="val" id="temp">--<span class="unit">&#176;C</span></div>
+  </div>
+  <div class="card">
+    <div class="lbl">Umidade</div>
+    <div class="val" id="hum">--<span class="unit">%</span></div>
+  </div>
   <div class="card" id="status-card">
-    <div class="label">Status</div>
+    <div class="lbl">Status</div>
     <div id="status-val">--</div>
     <div class="led-row">
-      <div class="led" id="led-green"></div><span class="led-label">SAFE</span>
-      <div class="led" id="led-red"></div><span class="led-label">ALERT</span>
+      <div class="led" id="led-green"></div><span class="led-lbl">SAFE</span>
+      <div class="led" id="led-red"></div><span class="led-lbl">ALERT</span>
     </div>
   </div>
 </div>
 
 <div class="chart-wrap">
-  <div class="chart-title">Temperatura (°C)</div>
-  <canvas id="chartTemp"></canvas>
+  <div class="ctitle">CO&#8322; Estimado (ppm) — MQ-135</div>
+  <canvas id="cCO2"></canvas>
 </div>
 <div class="chart-wrap">
-  <div class="chart-title">Cobertura vegetal (%)</div>
-  <canvas id="chartCov"></canvas>
+  <div class="ctitle">PM2.5 — Material Particulado (&#956;g/m&#179;)</div>
+  <canvas id="cPM25"></canvas>
 </div>
 <div class="chart-wrap">
-  <div class="chart-title">CO₂ estimado (ton/ha)</div>
-  <canvas id="chartCO2"></canvas>
+  <div class="ctitle">Temperatura (&#176;C) + Umidade (%)</div>
+  <canvas id="cTemp"></canvas>
 </div>
 
-<div class="config-wrap">
-  <div class="config-title">⚙️ Configurar thresholds — POST /api/config</div>
-  <div class="config-row">
-    <div class="config-field">
-      <label>LDR threshold (0–4095)</label>
-      <input type="number" id="cfg-ldr" placeholder="ex: 2500" min="0" max="4095">
+<div class="cfg-wrap">
+  <div class="cfg-title">&#9881;&#65039; Configurar Thresholds e Backend — POST /api/config</div>
+  <div class="cfg-row">
+    <div class="fld">
+      <label>CO&#8322; threshold (ppm)</label>
+      <input type="number" id="cfg-co2" placeholder="ex: 1000" min="400" max="5000">
     </div>
-    <div class="config-field">
-      <label>Temperatura threshold (°C)</label>
-      <input type="number" id="cfg-temp" placeholder="ex: 35" step="0.5">
+    <div class="fld">
+      <label>PM2.5 threshold (&#956;g/m&#179;)</label>
+      <input type="number" id="cfg-pm25" placeholder="ex: 35" step="0.5" min="0">
     </div>
-    <button class="btn" onclick="sendConfig()">Aplicar</button>
+    <div class="fld">
+      <label>Temp. threshold (&#176;C)</label>
+      <input type="number" id="cfg-temp" placeholder="ex: 40" step="0.5">
+    </div>
+    <div class="fld wide">
+      <label>Backend URL (POST a cada 30s — deixe vazio para desativar)</label>
+      <input type="url" id="cfg-url" placeholder="http://meu-servidor.com/api/iot/data">
+    </div>
+    <button class="btn" onclick="sendCfg()">Aplicar</button>
+  </div>
+  <div class="ref">
+    Referências EPA/CONAMA:
+    CO&#8322; &gt;1000ppm = ar comprometido &nbsp;|&nbsp;
+    PM2.5 &gt;35&#956;g/m&#179; = grupos sensíveis &nbsp;|&nbsp;
+    PM2.5 &gt;150 = perigoso
   </div>
   <div class="msg" id="cfg-msg"></div>
 </div>
 
-<footer>CarbonTrace v2.0 · ESP32 WebServer · Global Solution FIAP 2026/1</footer>
+<footer>CarbonTrace v3.0 · ESP32 + MQ-135 + DHT22 + PM2.5 · FIAP Global Solution 2026/1</footer>
 
 <script>
-const mkChart = (id, label, color) => new Chart(document.getElementById(id), {
-  type: 'line',
-  data: {
-    labels: [],
-    datasets: [{
-      label, data: [],
-      borderColor: color,
-      backgroundColor: color + '22',
-      borderWidth: 2, pointRadius: 3, tension: 0.4, fill: true
-    }]
-  },
-  options: {
-    responsive: true, animation: false,
-    scales: {
-      y: { grid: { color: '#2d3748' }, ticks: { color: '#64748b' } },
-      x: { grid: { color: '#2d3748' }, ticks: { color: '#64748b' } }
-    },
-    plugins: { legend: { display: false } }
-  }
+const AQI_COLORS={GOOD:'#34d399',MODERATE:'#fbbf24',UNHEALTHY:'#f97316',HAZARDOUS:'#ef4444'};
+const AQI_CLASS={GOOD:'aqi-good',MODERATE:'aqi-moderate',UNHEALTHY:'aqi-unhealthy',HAZARDOUS:'aqi-hazardous'};
+const AQI_TIPS={
+  GOOD:'Ar limpo — atividades ao ar livre recomendadas',
+  MODERATE:'Grupos sensíveis devem limitar exposição',
+  UNHEALTHY:'Evitar atividades externas prolongadas',
+  HAZARDOUS:'Emergência! Permaneça em ambientes fechados'
+};
+
+const mkC=(id,lbl,col)=>new Chart(document.getElementById(id),{
+  type:'line',
+  data:{labels:[],datasets:[{label:lbl,data:[],borderColor:col,backgroundColor:col+'22',
+    borderWidth:2,pointRadius:3,tension:.4,fill:true}]},
+  options:{responsive:true,animation:false,
+    scales:{y:{grid:{color:'#2d3748'},ticks:{color:'#64748b'}},
+            x:{grid:{color:'#2d3748'},ticks:{color:'#64748b'}}},
+    plugins:{legend:{display:false}}}
 });
 
-const chartTemp = mkChart('chartTemp', 'Temperatura', '#60a5fa');
-const chartCov  = mkChart('chartCov',  'Cobertura',   '#34d399');
-const chartCO2  = mkChart('chartCO2',  'CO2',         '#fb923c');
-const MAX_PTS   = 20;
+const cCO2=mkC('cCO2','CO2 ppm','#60a5fa');
+const cPM25=mkC('cPM25','PM2.5','#a78bfa');
+const cTemp=mkC('cTemp','Temp C','#fb923c');
+const MAX=20;
 
-function addPoint(chart, label, value) {
-  chart.data.labels.push(label);
-  chart.data.datasets[0].data.push(value);
-  if (chart.data.labels.length > MAX_PTS) {
-    chart.data.labels.shift();
-    chart.data.datasets[0].data.shift();
-  }
-  chart.update();
+function addPt(ch,l,v){
+  ch.data.labels.push(l);ch.data.datasets[0].data.push(v);
+  if(ch.data.labels.length>MAX){ch.data.labels.shift();ch.data.datasets[0].data.shift();}
+  ch.update();
 }
 
-async function fetchData() {
-  try {
-    const r = await fetch('/api/sensors');
-    const d = await r.json();
-    const lbl = d.uptime_s + 's';
+async function fetch5s(){
+  try{
+    const d=await(await fetch('/api/sensors')).json();
+    const l=d.uptime_s+'s';
 
-    document.getElementById('temp').innerHTML   = d.temperature  + '<span class="unit">°C</span>';
-    document.getElementById('hum').innerHTML    = d.humidity     + '<span class="unit">%</span>';
-    document.getElementById('ldr').textContent  = d.ldr_raw;
-    document.getElementById('cov').innerHTML    = d.coverage_pct + '<span class="unit">%</span>';
-    document.getElementById('co2').innerHTML    = d.co2_ton_ha   + '<span class="unit">t/ha</span>';
-    document.getElementById('status-val').innerHTML =
-      '<span class="badge ' + d.status + '">' + d.status + '</span>';
-    document.getElementById('status-card').className = 'card ' + (d.alert ? 'alert' : 'ok');
-    document.getElementById('led-green').className = 'led ' + (d.led_green ? 'on-green' : '');
-    document.getElementById('led-red').className   = 'led ' + (d.led_red   ? 'on-red'   : '');
+    document.getElementById('warmup-banner').style.display=d.mq135_ready?'none':'block';
 
-    addPoint(chartTemp, lbl, parseFloat(d.temperature));
-    addPoint(chartCov,  lbl, parseFloat(d.coverage_pct));
-    addPoint(chartCO2,  lbl, parseFloat(d.co2_ton_ha));
-  } catch(e) { console.warn('fetch error', e); }
+    document.getElementById('co2').innerHTML=d.co2_ppm+'<span class="unit">ppm</span>';
+    document.getElementById('pm25').innerHTML=d.pm25_ug_m3+'<span class="unit">&#956;g/m&#179;</span>';
+    document.getElementById('temp').innerHTML=d.temperature+'<span class="unit">&#176;C</span>';
+    document.getElementById('hum').innerHTML=d.humidity+'<span class="unit">%</span>';
+
+    const ac=document.getElementById('aqi-card');
+    ac.className='card '+(AQI_CLASS[d.air_quality]||'');
+    const av=document.getElementById('aqi-val');
+    av.textContent=d.air_quality;
+    av.style.color=AQI_COLORS[d.air_quality]||'#fff';
+    document.getElementById('aqi-badge').innerHTML=
+      '<span class="badge '+d.air_quality+'">'+d.air_quality+'</span>';
+    document.getElementById('aqi-tip').textContent=AQI_TIPS[d.air_quality]||'';
+
+    document.getElementById('status-val').innerHTML=
+      '<span class="badge '+d.status+'">'+d.status+'</span>';
+    document.getElementById('status-card').className='card '+(d.alert?'alert':'ok');
+    document.getElementById('led-green').className='led '+(d.led_green?'on-green':'');
+    document.getElementById('led-red').className='led '+(d.led_red?'on-red':'');
+
+    addPt(cCO2,l,parseFloat(d.co2_ppm));
+    addPt(cPM25,l,parseFloat(d.pm25_ug_m3));
+    addPt(cTemp,l,parseFloat(d.temperature));
+  }catch(e){console.warn('fetch',e);}
 }
 
-async function sendConfig() {
-  const ldr  = document.getElementById('cfg-ldr').value;
-  const temp = document.getElementById('cfg-temp').value;
-  const msg  = document.getElementById('cfg-msg');
-
-  if (!ldr && !temp) {
-    msg.style.color = '#f87171';
-    msg.textContent = 'Preencha ao menos um campo.';
-    return;
-  }
-
-  const body = {};
-  if (ldr)  body.ldr_threshold  = parseInt(ldr);
-  if (temp) body.temp_threshold = parseFloat(temp);
-
-  try {
-    const r = await fetch('/api/config', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    });
-    const d = await r.json();
-    msg.style.color = '#34d399';
-    msg.textContent = '✓ ' + d.message + ' — LDR: ' + d.ldr_threshold + ' | Temp: ' + d.temp_threshold + '°C';
-  } catch(e) {
-    msg.style.color = '#f87171';
-    msg.textContent = 'Erro ao enviar configuração.';
-  }
+async function sendCfg(){
+  const co2=document.getElementById('cfg-co2').value;
+  const pm25=document.getElementById('cfg-pm25').value;
+  const tmp=document.getElementById('cfg-temp').value;
+  const url=document.getElementById('cfg-url').value.trim();
+  const msg=document.getElementById('cfg-msg');
+  if(!co2&&!pm25&&!tmp&&!url){msg.style.color='#ef4444';msg.textContent='Preencha ao menos um campo.';return;}
+  const body={};
+  if(co2)body.co2_threshold=parseInt(co2);
+  if(pm25)body.pm25_threshold=parseFloat(pm25);
+  if(tmp)body.temp_threshold=parseFloat(tmp);
+  if(url)body.backend_url=url;
+  try{
+    const d=await(await fetch('/api/config',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
+    msg.style.color='#34d399';
+    msg.textContent='&#10003; '+d.message;
+  }catch(e){msg.style.color='#ef4444';msg.textContent='Erro ao enviar.';}
 }
 
-fetchData();
-setInterval(fetchData, 5000);
+fetch5s();setInterval(fetch5s,5000);
 </script>
-</body>
-</html>
-)rawhtml";
+</body></html>)rawhtml";
 
   server.send(200, "text/html", html);
 }
 
-// 404
+// ════════════════════════════════════════════════════════════
+//  404
+// ════════════════════════════════════════════════════════════
 void handleNotFound() {
   StaticJsonDocument<128> doc;
   doc["error"]     = "Endpoint nao encontrado";
-  doc["endpoints"] = "/dashboard | /api/sensors | /api/status | /api/carbon | /api/history | /api/config | /api/docs";
+  doc["endpoints"] = "/dashboard | /api/sensors | /api/status | /api/air-quality | /api/history | /api/config | /api/docs";
   String out;
   serializeJson(doc, out);
   server.send(404, "application/json", out);

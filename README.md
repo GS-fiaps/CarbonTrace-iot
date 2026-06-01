@@ -1,6 +1,6 @@
-# 🌿 CarbonTrace — IoT Monitor de Desmatamento
+# 🌿 CarbonTrace — Sensor de Qualidade do Ar (IoT)
 
-> **FIAP Global Solution 2026/1** · Disruptive Architectures: IoT, IoB & Generative IA  
+> **FIAP Global Solution 2026/1** · Disruptive Architectures: IoT, IoB & Generative IA
 > Turma: 2TDSPG
 
 ---
@@ -19,25 +19,34 @@
 
 ## 📌 Sobre o Projeto
 
-O **CarbonTrace** é uma plataforma de monitoramento de desmatamento e emissões de carbono.  
-Este repositório contém o **protótipo IoT** desenvolvido em ESP32, que simula sensores de campo
-que complementam o monitoramento via imagens satelitais.
+O **CarbonTrace** é uma plataforma de monitoramento ambiental com foco na correlação entre
+desmatamento e qualidade do ar.
 
-O dispositivo coleta dados ambientais em tempo real, detecta anomalias indicativas de
-desmatamento e disponibiliza as informações via **API REST** com dashboard web.
+Este repositório contém o **protótipo IoT v3.0** desenvolvido em **ESP32**, que monitora em
+tempo real a qualidade do ar por meio de três sensores complementares:
+- **MQ-135** — concentração de CO₂ e gases nocivos (ppm)
+- **DHT22** — temperatura (°C) e umidade relativa (%)
+- **PM2.5** — material particulado fino (µg/m³)
 
-> O módulo IoT é independente da API .NET do projeto — não há integração direta entre os dois.
+Os dados são disponibilizados via **API REST** com dashboard web e podem ser enviados
+automaticamente a um **backend externo** configurável via API, sem reiniciar o dispositivo.
+
+> O módulo IoT é independente da API .NET do projeto — a integração se dá exclusivamente
+> via HTTP POST para o endpoint configurado em `/api/config`.
 
 ---
 
-## 🛰️ Conexão com o Tema (Economia Espacial)
+## 🛰️ Conexão com o Tema (Economia Espacial / Desmatamento)
 
-Satélites de observação terrestre (como os do programa Sentinel/ESA e Landsat/NASA)
-monitoram a cobertura vegetal do planeta. O protótipo IoT simula uma **estação de campo**
-que calibra e valida esses dados satelitais com medições locais de:
+Satélites de observação terrestre (Sentinel/ESA, Landsat/NASA) monitoram a cobertura vegetal
+globalmente. Áreas desmatadas alteram significativamente a qualidade do ar local:
+- ↑ CO₂ e gases de combustão (queimadas)
+- ↑ Material particulado PM2.5 (fumaça, poeira exposta)
+- ↑ Temperatura (ausência do dossel)
+- ↓ Umidade relativa (perda de evapotranspiração)
 
-- 🌡️ Temperatura e umidade do ar (indicadores de saúde florestal)
-- ☀️ Luminosidade ambiente (proxy de cobertura do dossel vegetal)
+O protótipo IoT simula uma **estação de campo autônoma** que captura essas métricas,
+**validando e enriquecendo** os dados satelitais com medições in-situ.
 
 ---
 
@@ -47,37 +56,57 @@ que calibra e valida esses dados satelitais com medições locais de:
 
 | Componente | Função | Pino ESP32 |
 |---|---|---|
+| MQ-135 | Qualidade do ar — CO₂ / gases (ADC analógico) | GPIO34 (ADC1 CH6) |
+| PM2.5 (GP2Y1010) | Material particulado fino (ADC analógico) | GPIO35 (ADC1 CH7) |
 | DHT22 | Temperatura e umidade | GPIO4 |
-| LDR (fotoresistor) | Luminosidade / cobertura vegetal | GPIO34 (ADC) |
-| Push Button | Reset manual de alertas | GPIO14 |
-| LED Verde | Área segura (NORMAL) | GPIO18 |
-| LED Vermelho | Alerta de desmatamento | GPIO19 |
+| Push Button | Reset manual de alertas | GPIO14 (INPUT_PULLUP) |
+| LED Verde | Qualidade GOOD / NORMAL | GPIO18 |
+| LED Vermelho | Qualidade UNHEALTHY / HAZARDOUS / ALERTA | GPIO19 |
 | Buzzer | Alarme sonoro ao detectar alerta | GPIO23 |
-| LCD 16×2 I2C | Interface local de dados | SDA=21 / SCL=22 |
+| LCD 16×2 I2C | Interface local — CO₂ (ppm) + PM2.5 (µg/m³) | SDA=21 / SCL=22 |
 
-### Diagrama de ConexõesESP32 GPIO4  ──→ DHT22 DATA
-ESP32 GPIO34 ──→ LDR (divisor de tensão)
-ESP32 GPIO14 ──→ Push Button (INPUT_PULLUP)
-ESP32 GPIO18 ──→ Resistor 220Ω → LED Verde
-ESP32 GPIO19 ──→ Resistor 220Ω → LED Vermelho
-ESP32 GPIO23 ──→ Buzzer
-ESP32 GPIO21 ──→ LCD SDA (I2C)
-ESP32 GPIO22 ──→ LCD SCL (I2C)
+> **GPIO34 e GPIO35** são pinos *input-only* do ESP32, ideais para leitura ADC sem interferência
+> de saída. No Wokwi, ambos são simulados por **potenciômetros** que representam
+> a tensão analógica dos sensores reais.
+
+### Diagrama de Conexões
+
+```
+ESP32 GPIO4   ──→ DHT22 DATA
+ESP32 GPIO34  ──→ MQ-135 AOUT   (potenciômetro no simulador)
+ESP32 GPIO35  ──→ PM2.5 AOUT    (potenciômetro no simulador)
+ESP32 GPIO14  ──→ Push Button   (INPUT_PULLUP — outra perna ao GND)
+ESP32 GPIO18  ──→ Resistor 220Ω → LED Verde
+ESP32 GPIO19  ──→ Resistor 220Ω → LED Vermelho
+ESP32 GPIO23  ──→ Buzzer (+)
+ESP32 GPIO21  ──→ LCD SDA (I2C)
+ESP32 GPIO22  ──→ LCD SCL (I2C)
+```
 
 ---
 
-## 🧠 Lógica de FuncionamentoLDR lê luminosidade (0–4095 ADC)
-↓
-Cobertura vegetal (%) = 100 - (LDR / 4095 × 100)
-↓
-CO₂ estimado (ton/ha) = (1 - cobertura/100) × 150
-↓
-ALERTA se: LDR > 2500  OU  Temperatura > 35°C
-↓
-LED Vermelho + Buzzer (1s) + LCD "!ALERT"
+## 🧠 Lógica de Funcionamento
 
-**Referência:** Áreas desmatadas emitem aproximadamente 150 tonCO₂/ha/ano
-(base: IPCC AR6, dados de emissão por uso da terra).
+```
+MQ-135   lê tensão analógica (ADC 0–4095)
+  ↓  calcCO2Ppm()   → mapeamento linear: 400–5000 ppm
+DHT22    lê temperatura e umidade
+PM2.5    lê tensão analógica (ADC 0–4095)
+  ↓  calcPM25UgM3() → mapeamento linear: 0–500 µg/m³
+
+calcAirQuality(co2_ppm, pm25):
+  GOOD       → CO₂ ≤ 1000 ppm  E  PM2.5 ≤ 35 µg/m³
+  MODERATE   → CO₂ ≤ 1500 ppm  E  PM2.5 ≤ 55 µg/m³
+  UNHEALTHY  → CO₂ ≤ 2000 ppm  E  PM2.5 ≤ 150 µg/m³
+  HAZARDOUS  → CO₂ > 2000 ppm  OU PM2.5 > 150 µg/m³
+
+ALERTA se: CO₂ > 1000 ppm  OU  PM2.5 > 35 µg/m³  OU  Temp > 40°C
+  → LED Vermelho + Buzzer (1s) + LCD exibe dados críticos
+
+Envio automático ao backend a cada 30s (se backend_url configurado)
+```
+
+**Referências:** EPA Air Quality Index (AQI) · CONAMA Resolução 491/2018 · IPCC AR6
 
 ---
 
@@ -88,96 +117,127 @@ Base URL (Wokwi): `http://localhost:8180`
 ### `GET /api/sensors`
 Leitura atual de todos os sensores e estado dos atuadores.
 
-```json{
-"temperature": "27.4",
-"humidity": "68.2",
-"ldr_raw": 1820,
-"coverage_pct": "55.6",
-"co2_ton_ha": "66.60",
-"alert": false,
-"status": "NORMAL",
-"led_green": true,
-"led_red": false,
-"uptime_s": 120
+```json
+{
+  "temperature": "27.5",
+  "humidity": "72.0",
+  "co2_raw": 410,
+  "co2_ppm": "861",
+  "pm25_raw": 328,
+  "pm25_ug_m3": "40.0",
+  "air_quality": "MODERATE",
+  "alert": false,
+  "status": "NORMAL",
+  "led_green": true,
+  "led_red": false,
+  "mq135_ready": true,
+  "uptime_s": 120
 }
+```
+
+---
+
+### `GET /api/air-quality`
+Índice de qualidade do ar com descrição e recomendações para a população.
+
+```json
+{
+  "air_quality": "MODERATE",
+  "color_hex": "#fbbf24",
+  "co2_ppm": "861",
+  "pm25_ug_m3": "40.0",
+  "temperature_c": "27.5",
+  "humidity_pct": "72.0",
+  "alert": false,
+  "description": "Qualidade do ar moderada",
+  "recommendation": "Grupos sensiveis devem reduzir exposicao prolongada.",
+  "co2_threshold_ppm": 1000,
+  "pm25_threshold_ugm3": 35.0,
+  "mq135_ready": true
+}
+```
+
+`air_quality`: `GOOD` · `MODERATE` · `UNHEALTHY` · `HAZARDOUS`
 
 ---
 
 ### `GET /api/status`
-Status do dispositivo, thresholds ativos e contagem do histórico.
+Status do dispositivo, thresholds ativos, backend configurado e histórico.
 
-```json{
-"device": "CarbonTrace-ESP32",
-"firmware": "2.0.0",
-"wifi_ssid": "Wokwi-GUEST",
-"ip": "10.10.0.2",
-"uptime_s": 120,
-"alert": false,
-"ldr_threshold": 2500,
-"temp_threshold_c": 35.0,
-"history_count": 5
+```json
+{
+  "device": "CarbonTrace-ESP32",
+  "firmware": "3.0.0",
+  "wifi_ssid": "Wokwi-GUEST",
+  "ip": "10.10.0.2",
+  "uptime_s": 120,
+  "alert": false,
+  "mq135_ready": true,
+  "co2_threshold_ppm": 1000,
+  "pm25_threshold_ugm3": 35.0,
+  "temp_threshold_c": 40.0,
+  "backend_url": "(nao configurado)",
+  "history_count": 5
 }
-
----
-
-### `GET /api/carbon`
-Estimativa de emissão de carbono baseada na cobertura vegetal.
-
-```json{
-"coverage_pct": "55.6",
-"estimated_co2_ton_ha": "66.60",
-"risk_level": "MEDIUM",
-"ldr_raw": 1820,
-"threshold_pct": 70,
-"description": "Estimativa baseada em LDR como proxy de cobertura vegetal"
-}
-
-`risk_level`: `LOW` (≥70%) · `MEDIUM` (40–69%) · `HIGH` (<40%)
+```
 
 ---
 
 ### `GET /api/history`
-Últimas 10 leituras armazenadas em memória com timestamp de uptime.
+Últimas 10 leituras armazenadas em buffer circular com timestamp de uptime.
 
-```json{
-"total_records": 3,
-"readings": [
+```json
 {
-"uptime_s": 5,
-"temp": "27.4",
-"humidity": "68.0",
-"ldr": 1820,
-"coverage": "55.5",
-"co2": "66.75",
-"status": "NORMAL",
-"alert": false
+  "total_records": 3,
+  "readings": [
+    {
+      "uptime_s": 5,
+      "temp": "27.5",
+      "humidity": "72.0",
+      "co2_ppm": "861",
+      "pm25_ug_m3": "40.0",
+      "air_quality": "MODERATE",
+      "status": "NORMAL",
+      "alert": false
+    }
+  ]
 }
-]
-}
+```
 
 ---
 
 ### `POST /api/config`
-Altera os thresholds de alerta em tempo real, sem reiniciar o dispositivo.
+Altera thresholds e URL do backend em tempo real, sem reiniciar o dispositivo.
 
-**Body:**
-```json{
-"ldr_threshold": 2000,
-"temp_threshold": 32.0
+**Body (todos os campos são opcionais individualmente):**
+```json
+{
+  "co2_threshold": 800,
+  "pm25_threshold": 25.0,
+  "temp_threshold": 38.0,
+  "backend_url": "http://meu-servidor.com/api/iot/data"
 }
+```
 
 **Resposta:**
-```json{
-"message": "Configuracao atualizada",
-"ldr_threshold": 2000,
-"temp_threshold": 32.0
+```json
+{
+  "message": "Configuracao atualizada",
+  "co2_threshold_ppm": 800,
+  "pm25_threshold_ugm3": 25.0,
+  "temp_threshold_c": 38.0,
+  "backend_url": "http://meu-servidor.com/api/iot/data"
 }
+```
+
+> Após configurar `backend_url`, o ESP32 envia automaticamente um **POST JSON**
+> a cada 30 segundos com todos os dados dos sensores para integração com o backend .NET.
 
 ---
 
 ### `GET /dashboard`
-Painel HTML com gráficos em tempo real (atualiza a cada 5s).  
-Inclui formulário para alterar thresholds via `POST /api/config`.
+Painel HTML com gráficos em tempo real (atualiza a cada 5s).
+Inclui indicador de warm-up do MQ-135 e formulário para alterar thresholds + backend URL.
 
 ### `GET /api/docs`
 Documentação completa da API em HTML.
@@ -200,63 +260,108 @@ Documentação completa da API em HTML.
 | LiquidCrystal I2C | Frank de Brabander |
 | ArduinoJson | Benoit Blanchon |
 
-> `WiFi`, `WebServer` e `Wire` já vêm com o core ESP32.
+> `WiFi`, `WebServer`, `Wire`, `HTTPClient` já vêm com o core ESP32.
 
 ### Passo a Passo
 
-**1. Clonar o repositório**
-```bashgit clone https://github.com/<seu-usuario>/carbontrace-iot
-cd carbontrace-iot
+**1. Abrir o projeto no Arduino IDE**
 
-**2. Compilar no Arduino IDE**
-- Abra `carbontrace_v2.ino`
+- Abra `carbontrace-iot.ino`
 - Selecione a placa: `ESP32 Dev Module`
-- Compile: `Sketch → Verify/Compile` (`Ctrl+R`)
-- Os arquivos `.elf` e `.bin` serão gerados em:build/esp32.esp32.esp32doit-devkit-v1/
+
+**2. Compilar**
+
+```
+Sketch → Verify/Compile (Ctrl+R)
+```
+
+Os arquivos `.elf` e `.bin` serão gerados em:
+```
+build/esp32.esp32.esp32doit-devkit-v1/
+```
 
 **3. Iniciar a simulação no VS Code**
+
 - Pressione `F1` → `Wokwi: Start Simulator`
 - Aguarde o ESP32 conectar ao Wi-Fi (`Wokwi-GUEST`)
 - O IP aparecerá no Serial Monitor
 
-**4. Acessar o dashboard**http://localhost:8180/dashboard
+**4. Acessar o dashboard**
 
-### `wokwi.toml`
-```toml[wokwi]
-version = 1
-elf = "build/esp32.esp32.esp32doit-devkit-v1/carbontrace_v2.ino.elf"
-firmware = "build/esp32.esp32.esp32doit-devkit-v1/carbontrace_v2.ino.bin"[[wifi]]
-ssid = "Wokwi-GUEST"
-password = ""
-internet = true
-channel = 6[[net.forward]]
-from = "0.0.0.0:8180"
-to = "target:80"
+```
+http://localhost:8180/dashboard
+```
+
+### Simulando os sensores no Wokwi
+
+| Sensor | Componente Wokwi | Como simular |
+|---|---|---|
+| MQ-135 (CO₂) | Potenciômetro em GPIO34 | Gire para cima → mais CO₂ (ppm) |
+| PM2.5 | Potenciômetro em GPIO35 | Gire para cima → mais partículas (µg/m³) |
+| DHT22 | wokwi-dht22 | Edite `attrs.temperature` e `attrs.humidity` no `diagram.json` |
 
 ---
 
 ## 🧪 Testando os Endpoints
 
-```bashLeitura atual
-curl http://localhost:8180/api/sensorsStatus do dispositivo
-curl http://localhost:8180/api/statusEstimativa de carbono
-curl http://localhost:8180/api/carbonHistórico
-curl http://localhost:8180/api/historyAlterar thresholds
-curl -X POST http://localhost:8180/api/config 
--H "Content-Type: application/json" 
--d '{"ldr_threshold": 2000, "temp_threshold": 32.0}'
+```bash
+# Leitura atual
+curl http://localhost:8180/api/sensors
+
+# Índice de qualidade do ar
+curl http://localhost:8180/api/air-quality
+
+# Status do dispositivo
+curl http://localhost:8180/api/status
+
+# Histórico (últimas 10 leituras)
+curl http://localhost:8180/api/history
+
+# Alterar thresholds + configurar backend externo
+curl -X POST http://localhost:8180/api/config \
+  -H "Content-Type: application/json" \
+  -d '{
+    "co2_threshold": 800,
+    "pm25_threshold": 25.0,
+    "temp_threshold": 38.0,
+    "backend_url": "http://meu-backend.com/api/iot/data"
+  }'
+```
 
 ---
-## Funcionamento 
-![alt text](image.png)
-![alt text](image-1.png)
+
+## 📡 Integração com Backend Externo
+
+Após configurar `backend_url` via `POST /api/config`, o ESP32 envia automaticamente a cada 30s:
+
+```json
+{
+  "device": "CarbonTrace-ESP32",
+  "timestamp_s": 120,
+  "temperature": "27.5",
+  "humidity": "72.0",
+  "co2_ppm": "861",
+  "pm25_ug_m3": "40.0",
+  "air_quality": "MODERATE",
+  "alert": false,
+  "status": "NORMAL"
+}
+```
+
+Para desativar o envio, envie `"backend_url": ""` via `POST /api/config`.
 
 ---
-## 📁 Estrutura do Repositóriocarbontrace-iot/
-├── carbontrace-iot.ino   # Código principal ESP32
-├── diagram.json         # Circuito Wokwi
-├── wokwi.toml           # Configuração do simulador
+
+## 📁 Estrutura do Repositório
+
+```
+carbontrace-iot/
+├── carbontrace-iot.ino   # Código principal ESP32 (v3.0)
+├── diagram.json          # Circuito Wokwi
+├── wokwi.toml            # Configuração do simulador
+├── libraries.txt         # Dependências
 └── README.md
+```
 
 ---
 
