@@ -8,14 +8,14 @@
 //  Saidas:    LED Verde (GPIO18) | LED Vermelho (GPIO19) | Buzzer (GPIO23)
 //  Controle:  Botão Reset (GPIO14)
 //  Interface: LCD 16x2 I2C (SDA=21 / SCL=22)
-//  Rede:      Wi-Fi + WebServer porta 80 + HTTP POST para backend externo
+//  Rede:      Wi-Fi + WebServer porta 80
 //
 //  Endpoints:
 //    GET  /api/sensors     — leitura atual de todos os sensores
 //    GET  /api/status      — status do dispositivo e configurações
 //    GET  /api/air-quality — índice de qualidade do ar e recomendações
 //    GET  /api/history     — histórico de leituras (últimas 10)
-//    POST /api/config      — altera thresholds e URL do backend
+//    POST /api/config      — altera thresholds de alerta
 //    GET  /api/docs        — documentação da API (HTML)
 //    GET  /dashboard       — painel HTML em tempo real
 //
@@ -25,7 +25,6 @@
 
 #include <WiFi.h>
 #include <WebServer.h>
-#include <HTTPClient.h>   // ESP32 Arduino core — client HTTP para backend
 #include <DHT.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
@@ -49,13 +48,6 @@ const char* PASSWORD = "";
 int   co2AlertThreshold  = 1000;   // ppm   — acima: ar comprometido
 float pm25AlertThreshold = 35.0f;  // µg/m³ — acima: não saudável (EPA)
 float tempAlertThreshold = 40.0f;  // °C    — acima: temperatura crítica
-
-// ── Backend Externo ──────────────────────────────────────────
-// Configurar via POST /api/config com campo "backend_url"
-// Envio automático a cada BACKEND_INTERVAL milissegundos
-String backendUrl = "";
-const  unsigned long BACKEND_INTERVAL = 30000UL; // 30 segundos
-unsigned long lastBackendPost = 0;
 
 // ── Objetos Globais ──────────────────────────────────────────
 DHT               dht(DHT_PIN, DHT_TYPE);
@@ -109,7 +101,6 @@ void updateBuzzer();
 void checkButton();
 void resetAlerts();
 void saveToHistory(SensorReading& r);
-void sendToBackend();
 void handleDashboard();
 void handleSensors();
 void handleStatus();
@@ -239,13 +230,6 @@ void loop() {
       mq135Ready ? "" : " (warm-up)"
     );
   }
-
-  // Envio periódico ao backend externo
-  if (backendUrl.length() > 0 &&
-      (millis() - lastBackendPost >= BACKEND_INTERVAL)) {
-    lastBackendPost = millis();
-    sendToBackend();
-  }
 }
 
 // ════════════════════════════════════════════════════════════
@@ -311,44 +295,6 @@ void saveToHistory(SensorReading& r) {
   history[historyIndex] = r;
   historyIndex = (historyIndex + 1) % 10;
   if (historyCount < 10) historyCount++;
-}
-
-// ════════════════════════════════════════════════════════════
-//  ENVIO PARA BACKEND EXTERNO
-// ════════════════════════════════════════════════════════════
-void sendToBackend() {
-  if (WiFi.status() != WL_CONNECTED) return;
-
-  HTTPClient http;
-  if (!http.begin(backendUrl)) {
-    Serial.println("[BACKEND] Falha ao iniciar: " + backendUrl);
-    return;
-  }
-  http.addHeader("Content-Type", "application/json");
-  http.setTimeout(5000);
-
-  // Payload com todos os dados de qualidade do ar
-  StaticJsonDocument<384> doc;
-  doc["device"]      = "CarbonTrace-ESP32";
-  doc["timestamp_s"] = current.uptimeS;
-  doc["temperature"] = serialized(String(current.temperature, 1));
-  doc["humidity"]    = serialized(String(current.humidity,    1));
-  doc["co2_ppm"]     = serialized(String(current.co2Ppm,      0));
-  doc["pm25_ug_m3"]  = serialized(String(current.pm25UgM3,    1));
-  doc["air_quality"] = current.airQuality;
-  doc["alert"]       = current.alert;
-  doc["status"]      = current.status;
-
-  String payload;
-  serializeJson(doc, payload);
-
-  int code = http.POST(payload);
-  if (code > 0) {
-    Serial.printf("[BACKEND] POST %d -> %s\n", code, backendUrl.c_str());
-  } else {
-    Serial.printf("[BACKEND] Erro: %s\n", http.errorToString(code).c_str());
-  }
-  http.end();
 }
 
 // ════════════════════════════════════════════════════════════
@@ -457,7 +403,6 @@ void handleStatus() {
   doc["co2_threshold_ppm"]   = co2AlertThreshold;
   doc["pm25_threshold_ugm3"] = pm25AlertThreshold;
   doc["temp_threshold_c"]    = tempAlertThreshold;
-  doc["backend_url"]         = (backendUrl.length() > 0) ? backendUrl : "(nao configurado)";
   doc["history_count"]       = historyCount;
 
   String out;
@@ -560,23 +505,20 @@ void handleConfig() {
   if (req.containsKey("co2_threshold"))  { co2AlertThreshold  = req["co2_threshold"].as<int>();   changed = true; }
   if (req.containsKey("pm25_threshold")) { pm25AlertThreshold = req["pm25_threshold"].as<float>(); changed = true; }
   if (req.containsKey("temp_threshold")) { tempAlertThreshold = req["temp_threshold"].as<float>(); changed = true; }
-  if (req.containsKey("backend_url"))    { backendUrl = req["backend_url"].as<String>();           changed = true; }
 
   if (!changed) {
     server.send(400, "application/json", "{\"error\":\"Nenhum campo valido\"}");
     return;
   }
 
-  Serial.printf("[CONFIG] CO2=%dppm | PM25=%.1f ug/m3 | Temp=%.1fC | Backend=%s\n",
-    co2AlertThreshold, pm25AlertThreshold, tempAlertThreshold,
-    backendUrl.length() ? backendUrl.c_str() : "(desativado)");
+  Serial.printf("[CONFIG] CO2=%dppm | PM25=%.1f ug/m3 | Temp=%.1fC\n",
+    co2AlertThreshold, pm25AlertThreshold, tempAlertThreshold);
 
   StaticJsonDocument<256> res;
   res["message"]             = "Configuracao atualizada";
   res["co2_threshold_ppm"]   = co2AlertThreshold;
   res["pm25_threshold_ugm3"] = pm25AlertThreshold;
   res["temp_threshold_c"]    = tempAlertThreshold;
-  res["backend_url"]         = (backendUrl.length() > 0) ? backendUrl : "(desativado)";
 
   String out;
   serializeJson(res, out);
@@ -646,12 +588,12 @@ void handleDocs() {
 
 <div class="ep">
   <div class="row"><span class="m get">GET</span><span class="path">/api/status</span></div>
-  <p class="desc">Status do dispositivo, thresholds ativos, backend configurado e contagem do histórico.</p>
+  <p class="desc">Status do dispositivo, thresholds ativos e contagem do histórico.</p>
   <div class="lbl">Resposta</div>
   <pre>{ "device":"CarbonTrace-ESP32","firmware":"3.0.0","ip":"10.10.0.2",
   "uptime_s":120,"alert":false,"mq135_ready":true,
   "co2_threshold_ppm":1000,"pm25_threshold_ugm3":35.0,"temp_threshold_c":40.0,
-  "backend_url":"(nao configurado)","history_count":5 }</pre>
+  "history_count":5 }</pre>
 </div>
 
 <div class="ep">
@@ -667,17 +609,15 @@ void handleDocs() {
 
 <div class="ep">
   <div class="row"><span class="m post">POST</span><span class="path">/api/config</span></div>
-  <p class="desc">Altera thresholds de alerta e URL do backend em tempo real, sem reiniciar o dispositivo.</p>
+  <p class="desc">Altera thresholds de alerta em tempo real, sem reiniciar o dispositivo.</p>
   <div class="lbl">Body (JSON) — todos os campos são opcionais individualmente</div>
   <pre>{ "co2_threshold": 800,
   "pm25_threshold": 25.0,
-  "temp_threshold": 38.0,
-  "backend_url": "http://meu-servidor.com/api/iot/data" }</pre>
+  "temp_threshold": 38.0 }</pre>
   <div class="lbl" style="margin-top:12px">Resposta</div>
   <pre>{ "message":"Configuracao atualizada",
   "co2_threshold_ppm":800,"pm25_threshold_ugm3":25.0,
-  "temp_threshold_c":38.0,"backend_url":"http://meu-servidor.com/api/iot/data" }</pre>
-  <div class="note">Após configurar backend_url, o ESP32 fará POST automático a cada 30 s com todos os dados dos sensores.</div>
+  "temp_threshold_c":38.0 }</pre>
 </div>
 
 </body></html>)rawhtml";
@@ -809,36 +749,6 @@ void handleDashboard() {
   <canvas id="cTemp"></canvas>
 </div>
 
-<div class="cfg-wrap">
-  <div class="cfg-title">&#9881;&#65039; Configurar Thresholds e Backend — POST /api/config</div>
-  <div class="cfg-row">
-    <div class="fld">
-      <label>CO&#8322; threshold (ppm)</label>
-      <input type="number" id="cfg-co2" placeholder="ex: 1000" min="400" max="5000">
-    </div>
-    <div class="fld">
-      <label>PM2.5 threshold (&#956;g/m&#179;)</label>
-      <input type="number" id="cfg-pm25" placeholder="ex: 35" step="0.5" min="0">
-    </div>
-    <div class="fld">
-      <label>Temp. threshold (&#176;C)</label>
-      <input type="number" id="cfg-temp" placeholder="ex: 40" step="0.5">
-    </div>
-    <div class="fld wide">
-      <label>Backend URL (POST a cada 30s — deixe vazio para desativar)</label>
-      <input type="url" id="cfg-url" placeholder="http://meu-servidor.com/api/iot/data">
-    </div>
-    <button class="btn" onclick="sendCfg()">Aplicar</button>
-  </div>
-  <div class="ref">
-    Referências EPA/CONAMA:
-    CO&#8322; &gt;1000ppm = ar comprometido &nbsp;|&nbsp;
-    PM2.5 &gt;35&#956;g/m&#179; = grupos sensíveis &nbsp;|&nbsp;
-    PM2.5 &gt;150 = perigoso
-  </div>
-  <div class="msg" id="cfg-msg"></div>
-</div>
-
 <footer>CarbonTrace v3.0 · ESP32 + MQ-135 + DHT22 + PM2.5 · FIAP Global Solution 2026/1</footer>
 
 <script>
@@ -909,14 +819,12 @@ async function sendCfg(){
   const co2=document.getElementById('cfg-co2').value;
   const pm25=document.getElementById('cfg-pm25').value;
   const tmp=document.getElementById('cfg-temp').value;
-  const url=document.getElementById('cfg-url').value.trim();
   const msg=document.getElementById('cfg-msg');
-  if(!co2&&!pm25&&!tmp&&!url){msg.style.color='#ef4444';msg.textContent='Preencha ao menos um campo.';return;}
+  if(!co2&&!pm25&&!tmp){msg.style.color='#ef4444';msg.textContent='Preencha ao menos um campo.';return;}
   const body={};
   if(co2)body.co2_threshold=parseInt(co2);
   if(pm25)body.pm25_threshold=parseFloat(pm25);
   if(tmp)body.temp_threshold=parseFloat(tmp);
-  if(url)body.backend_url=url;
   try{
     const d=await(await fetch('/api/config',{method:'POST',
       headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
