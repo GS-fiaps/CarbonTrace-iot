@@ -1,6 +1,6 @@
 # 🌿 CarbonTrace — Sensor de Qualidade do Ar (IoT)
 
-> **FIAP Global Solution 2026/1** · Disruptive Architectures: IoT, IoB & Generative IA
+> **FIAP Global Solution 2026/1** · Disruptive Architectures: IoT, IoB & Generative IA  
 > Turma: 2TDSPG
 
 ---
@@ -28,11 +28,10 @@ tempo real a qualidade do ar por meio de três sensores complementares:
 - **DHT22** — temperatura (°C) e umidade relativa (%)
 - **PM2.5** — material particulado fino (µg/m³)
 
-Os dados são disponibilizados via **API REST** com dashboard web e podem ser enviados
-automaticamente a um **backend externo** configurável via API, sem reiniciar o dispositivo.
+Os dados são disponibilizados via **API REST** com dashboard web em tempo real,
+acessível pelo navegador durante a simulação no Wokwi.
 
-> O módulo IoT é independente da API .NET do projeto — a integração se dá exclusivamente
-> via HTTP POST para o endpoint configurado em `/api/config`.
+> O módulo IoT é independente
 
 ---
 
@@ -54,10 +53,20 @@ O protótipo IoT simula uma **estação de campo autônoma** que captura essas m
 
 ### Componentes
 
+> **Todos os sensores analógicos são simulados por potenciômetros.**
+> Gire o dial no Wokwi para variar a leitura ADC e observar a resposta do sistema.
+
+| Sensor | Componente Wokwi | Como simular |
+|---|---|---|
+| MQ-135 (CO₂) | Potenciômetro GPIO34 | Gire para cima → mais CO₂ (ppm) |
+| PM2.5 | Potenciômetro GPIO35 | Gire para cima → mais PM2.5 (µg/m³) |
+| DHT22 | wokwi-dht22 | Clique no sensor → edite temperatura e umidade |
+
+
 | Componente | Função | Pino ESP32 |
 |---|---|---|
-| MQ-135 | Qualidade do ar — CO₂ / gases (ADC analógico) | GPIO34 (ADC1 CH6) |
-| PM2.5 (GP2Y1010) | Material particulado fino (ADC analógico) | GPIO35 (ADC1 CH7) |
+| MQ-135 *(simulado por potenciômetro)* | Qualidade do ar — CO₂ / gases (ADC analógico) | GPIO34 (ADC1 CH6) |
+| PM2.5 GP2Y1010 *(simulado por potenciômetro)* | Material particulado fino (ADC analógico) | GPIO35 (ADC1 CH7) |
 | DHT22 | Temperatura e umidade | GPIO4 |
 | Push Button | Reset manual de alertas | GPIO14 (INPUT_PULLUP) |
 | LED Verde | Qualidade GOOD / NORMAL | GPIO18 |
@@ -65,13 +74,19 @@ O protótipo IoT simula uma **estação de campo autônoma** que captura essas m
 | Buzzer | Alarme sonoro ao detectar alerta | GPIO23 |
 | LCD 16×2 I2C | Interface local — CO₂ (ppm) + PM2.5 (µg/m³) | SDA=21 / SCL=22 |
 
-> **GPIO34 e GPIO35** são pinos *input-only* do ESP32, ideais para leitura ADC sem interferência
-> de saída. No Wokwi, ambos são simulados por **potenciômetros** que representam
+
+> **Simulação no Wokwi:** os sensores MQ-135 e PM2.5 são representados por
+> **potenciômetros** que simulam a tensão analógica de saída dos sensores reais.
+> Girando o potenciômetro para cima aumenta o valor ADC lido pelo ESP32,
+> que é convertido para ppm (CO₂) e µg/m³ (PM2.5) pela lógica do código.
+> Em hardware físico, basta substituir os potenciômetros pelos sensores reais
+> nos mesmos pinos GPIO sem alterar o código.
+
+> **GPIO34 e GPIO35** são pinos *input-only* do ESP32, ideais para leitura ADC.
+> No Wokwi, ambos são simulados por **potenciômetros** que representam
 > a tensão analógica dos sensores reais.
 
 ### Diagrama de Conexões
-
-```
 ESP32 GPIO4   ──→ DHT22 DATA
 ESP32 GPIO34  ──→ MQ-135 AOUT   (potenciômetro no simulador)
 ESP32 GPIO35  ──→ PM2.5 AOUT    (potenciômetro no simulador)
@@ -81,34 +96,52 @@ ESP32 GPIO19  ──→ Resistor 220Ω → LED Vermelho
 ESP32 GPIO23  ──→ Buzzer (+)
 ESP32 GPIO21  ──→ LCD SDA (I2C)
 ESP32 GPIO22  ──→ LCD SCL (I2C)
-```
 
 ---
 
 ## 🧠 Lógica de Funcionamento
-
-```
 MQ-135   lê tensão analógica (ADC 0–4095)
-  ↓  calcCO2Ppm()   → mapeamento linear: 400–5000 ppm
+↓  calcCO2Ppm()   → mapeamento linear: 400–5000 ppm
 DHT22    lê temperatura e umidade
 PM2.5    lê tensão analógica (ADC 0–4095)
-  ↓  calcPM25UgM3() → mapeamento linear: 0–500 µg/m³
-
+↓  calcPM25UgM3() → mapeamento linear: 0–500 µg/m³
 calcAirQuality(co2_ppm, pm25):
-  GOOD       → CO₂ ≤ 1000 ppm  E  PM2.5 ≤ 35 µg/m³
-  MODERATE   → CO₂ ≤ 1500 ppm  E  PM2.5 ≤ 55 µg/m³
-  UNHEALTHY  → CO₂ ≤ 2000 ppm  E  PM2.5 ≤ 150 µg/m³
-  HAZARDOUS  → CO₂ > 2000 ppm  OU PM2.5 > 150 µg/m³
-
+GOOD       → CO₂ ≤ 1000 ppm  E  PM2.5 ≤ 35 µg/m³
+MODERATE   → CO₂ ≤ 1500 ppm  E  PM2.5 ≤ 55 µg/m³
+UNHEALTHY  → CO₂ ≤ 2000 ppm  E  PM2.5 ≤ 150 µg/m³
+HAZARDOUS  → CO₂ > 2000 ppm  OU PM2.5 > 150 µg/m³
 ALERTA se: CO₂ > 1000 ppm  OU  PM2.5 > 35 µg/m³  OU  Temp > 40°C
-  → LED Vermelho + Buzzer (1s) + LCD exibe dados críticos
-
-Envio automático ao backend a cada 30s (se backend_url configurado)
-```
+→ LED Vermelho + Buzzer (1s) + LCD alterna para tela de AQI
+→ Botão RESET zera alertas e histórico via hardware
 
 **Referências:** EPA Air Quality Index (AQI) · CONAMA Resolução 491/2018 · IPCC AR6
 
 ---
+
+## 🔬 Decisão de Design — Por que Potenciômetros?
+
+Na primeira versão do protótipo utilizamos um **LDR (fotoresistor)** como simulador de cobertura
+vegetal. O professor apontou um problema crítico: o LDR mede **luminosidade**, e qualquer
+variação de luz — nuvem passando, sombra, horário do dia — disparava falso positivo sem
+nenhuma relação real com desmatamento ou qualidade do ar.
+
+Na v3.0 migramos para sensores específicos e semanticamente corretos:
+
+| Sensor real | O que mede | Relação com desmatamento |
+|---|---|---|
+| MQ-135 | CO₂ e gases nocivos (ppm) | Queimadas elevam CO₂ diretamente |
+| PM2.5 | Material particulado (µg/m³) | Fumaça e poeira exposta após desmate |
+| DHT22 | Temperatura e umidade | Ausência do dossel eleva temp e reduz umidade |
+
+### Por que potenciômetros no simulador?
+
+O Wokwi não possui modelos simulados do MQ-135 nem do PM2.5 em sua biblioteca de componentes.
+A solução adotada é tecnicamente equivalente ao sensor físico:
+
+O potenciômetro e o sensor real funcionam da mesma forma para o ESP32:
+ambos entregam um valor entre 0 e 4095 no pino ADC quando lidos pelo `analogRead()`.
+Girar o potenciômetro para cima é equivalente a expor o sensor a mais CO₂ ou mais partículas.
+
 
 ## 🌐 API REST — Endpoints
 
@@ -162,7 +195,7 @@ Leitura atual de todos os sensores e estado dos atuadores.
 ---
 
 ### `GET /api/status`
-Status do dispositivo, thresholds ativos, backend configurado e histórico.
+Status do dispositivo, thresholds ativos e contagem do histórico.
 
 ```json
 {
@@ -176,7 +209,6 @@ Status do dispositivo, thresholds ativos, backend configurado e histórico.
   "co2_threshold_ppm": 1000,
   "pm25_threshold_ugm3": 35.0,
   "temp_threshold_c": 40.0,
-  "backend_url": "(nao configurado)",
   "history_count": 5
 }
 ```
@@ -207,15 +239,14 @@ Status do dispositivo, thresholds ativos, backend configurado e histórico.
 ---
 
 ### `POST /api/config`
-Altera thresholds e URL do backend em tempo real, sem reiniciar o dispositivo.
+Altera thresholds de alerta em tempo real, sem reiniciar o dispositivo.
 
 **Body (todos os campos são opcionais individualmente):**
 ```json
 {
   "co2_threshold": 800,
   "pm25_threshold": 25.0,
-  "temp_threshold": 38.0,
-  "backend_url": "http://meu-servidor.com/api/iot/data"
+  "temp_threshold": 38.0
 }
 ```
 
@@ -225,24 +256,43 @@ Altera thresholds e URL do backend em tempo real, sem reiniciar o dispositivo.
   "message": "Configuracao atualizada",
   "co2_threshold_ppm": 800,
   "pm25_threshold_ugm3": 25.0,
-  "temp_threshold_c": 38.0,
-  "backend_url": "http://meu-servidor.com/api/iot/data"
+  "temp_threshold_c": 38.0
 }
 ```
-
-> Após configurar `backend_url`, o ESP32 envia automaticamente um **POST JSON**
-> a cada 30 segundos com todos os dados dos sensores para integração com o backend .NET.
 
 ---
 
 ### `GET /dashboard`
-Painel HTML com gráficos em tempo real (atualiza a cada 5s).
-Inclui indicador de warm-up do MQ-135 e formulário para alterar thresholds + backend URL.
+Painel HTML com atualização a cada 5s. Contém:
+- Cards de sensores com IQA, CO₂, PM2.5, temperatura e umidade
+- Gráficos de linha em tempo real com horário no eixo X
+- Tabela das últimas 10 leituras
+- Formulário para alterar thresholds via `POST /api/config`
+- Banner de warm-up do MQ-135 (20s)
 
 ### `GET /api/docs`
 Documentação completa da API em HTML.
 
 ---
+## 👀 Prints de Funcionamento
+
+### dashBoard 
+![alt text](image.png)
+
+### api/Docs 
+![alt text](image-1.png)
+
+### api/sensors
+![alt text](image-2.png)
+
+### api/air-quality
+![alt text](image-3.png)
+
+### api/history
+![alt text](image-4.png)
+
+### api/status
+![alt text](image-5.png)
 
 ## 🖥️ Como Simular no Wokwi
 
@@ -260,45 +310,48 @@ Documentação completa da API em HTML.
 | LiquidCrystal I2C | Frank de Brabander |
 | ArduinoJson | Benoit Blanchon |
 
-> `WiFi`, `WebServer`, `Wire`, `HTTPClient` já vêm com o core ESP32.
+> `WiFi`, `WebServer` e `Wire` já vêm com o core ESP32.
 
 ### Passo a Passo
 
-**1. Abrir o projeto no Arduino IDE**
+**1. Clonar o repositório**
+```bash
+git clone https://github.com/<usuario>/carbontrace-iot
+cd carbontrace-iot
+```
 
-- Abra `carbontrace-iot.ino`
+**2. Abrir e compilar no Arduino IDE**
+- Abra `carbontrace-iot/carbontrace-iot.ino`
 - Selecione a placa: `ESP32 Dev Module`
+- Compile: `Ctrl+R`
 
-**2. Compilar**
-
-```
-Sketch → Verify/Compile (Ctrl+R)
-```
-
-Os arquivos `.elf` e `.bin` serão gerados em:
-```
-build/esp32.esp32.esp32doit-devkit-v1/
-```
+Os arquivos gerados ficarão em:
+carbontrace-iot/build/esp32.esp32.esp32doit-devkit-v1/
 
 **3. Iniciar a simulação no VS Code**
-
 - Pressione `F1` → `Wokwi: Start Simulator`
 - Aguarde o ESP32 conectar ao Wi-Fi (`Wokwi-GUEST`)
 - O IP aparecerá no Serial Monitor
 
 **4. Acessar o dashboard**
-
-```
 http://localhost:8180/dashboard
-```
 
 ### Simulando os sensores no Wokwi
 
 | Sensor | Componente Wokwi | Como simular |
 |---|---|---|
-| MQ-135 (CO₂) | Potenciômetro em GPIO34 | Gire para cima → mais CO₂ (ppm) |
-| PM2.5 | Potenciômetro em GPIO35 | Gire para cima → mais partículas (µg/m³) |
-| DHT22 | wokwi-dht22 | Edite `attrs.temperature` e `attrs.humidity` no `diagram.json` |
+| MQ-135 (CO₂) | Potenciômetro GPIO34 | Gire para cima → mais CO₂ (ppm) |
+| PM2.5 | Potenciômetro GPIO35 | Gire para cima → mais PM2.5 (µg/m³) |
+| DHT22 | wokwi-dht22 | Clique no sensor → edite temperatura e umidade |
+
+### Cenários de teste recomendados
+
+| Cenário | MQ-135 | PM2.5 | Temp | IQA esperado |
+|---|---|---|---|---|
+| Ar limpo | ~200 | ~50 | 25°C | GOOD |
+| Atenção | ~800 | ~290 | 28°C | MODERATE |
+| Alerta | ~1200 | ~450 | 32°C | UNHEALTHY |
+| Emergência | ~2000 | ~1300 | 38°C | HAZARDOUS |
 
 ---
 
@@ -317,55 +370,36 @@ curl http://localhost:8180/api/status
 # Histórico (últimas 10 leituras)
 curl http://localhost:8180/api/history
 
-# Alterar thresholds + configurar backend externo
+# Alterar thresholds em tempo real
 curl -X POST http://localhost:8180/api/config \
   -H "Content-Type: application/json" \
-  -d '{
-    "co2_threshold": 800,
-    "pm25_threshold": 25.0,
-    "temp_threshold": 38.0,
-    "backend_url": "http://meu-backend.com/api/iot/data"
-  }'
+  -d '{"co2_threshold": 800, "pm25_threshold": 25.0, "temp_threshold": 38.0}'
 ```
-
----
-
-## 📡 Integração com Backend Externo
-
-Após configurar `backend_url` via `POST /api/config`, o ESP32 envia automaticamente a cada 30s:
-
-```json
-{
-  "device": "CarbonTrace-ESP32",
-  "timestamp_s": 120,
-  "temperature": "27.5",
-  "humidity": "72.0",
-  "co2_ppm": "861",
-  "pm25_ug_m3": "40.0",
-  "air_quality": "MODERATE",
-  "alert": false,
-  "status": "NORMAL"
-}
-```
-
-Para desativar o envio, envie `"backend_url": ""` via `POST /api/config`.
 
 ---
 
 ## 📁 Estrutura do Repositório
-
-```
-carbontrace-iot/
-├── carbontrace-iot.ino   # Código principal ESP32 (v3.0)
-├── diagram.json          # Circuito Wokwi
-├── wokwi.toml            # Configuração do simulador
-├── libraries.txt         # Dependências
+CarbonTrace-iot/
+├── carbontrace-iot/
+│   ├── build/                          # Binários gerados pelo Arduino IDE
+│   ├── libraries/                      # Bibliotecas locais do projeto
+│   └── carbontrace-iot.ino             # Código principal ESP32 (v3.0)
+├── diagram.json                        # Circuito Wokwi
+├── wokwi.toml                          # Configuração do simulador
+├── libraries.txt                       # Lista de dependências
 └── README.md
-```
 
 ---
 
 ## 🔗 Links
-
 - 🎥 Vídeo de demonstração: *(link YouTube)*
-- 📡 Repositório API .NET: *(link GitHub)*
+
+---
+
+## 🎯 Conexão com os ODS da ONU
+
+| ODS | Contribuição |
+|---|---|
+| **13** — Ação climática | Monitoramento de CO₂ e emissões por desmatamento |
+| **15** — Vida terrestre | Correlação entre cobertura vegetal e qualidade do ar |
+| **9** — Inovação e infraestrutura | Uso de IoT + dados satelitais para monitoramento ambiental |

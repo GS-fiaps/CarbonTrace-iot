@@ -1,16 +1,14 @@
 [wokwi]
 version = 1
-elf = "build/esp32.esp32.esp32doit-devkit-v1/esp32-webserver-wokwi.ino.elf"
-firmware = "build/esp32.esp32.esp32doit-devkit-v1/esp32-webserver-wokwi.ino.bin"
+elf = "carbontrace-iot/build/esp32.esp32.esp32doit-devkit-v1/carbontrace-iot.ino.elf"
+firmware = "carbontrace-iot/build/esp32.esp32.esp32doit-devkit-v1/carbontrace-iot.ino.bin"
 
-# WiFi Configuration
 [[wifi]]
 ssid = "Wokwi-GUEST"
 password = ""
 internet = true
 channel = 6
 
-# Forward http://localhost:8180 -> porta 80 do ESP32
 [[net.forward]]
 from = "0.0.0.0:8180"
 to = "target:80"
