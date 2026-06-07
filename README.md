@@ -392,7 +392,7 @@ CarbonTrace-iot/
 ---
 
 ## 🔗 Links
-- 🎥 Vídeo de demonstração: *(link YouTube)*
+- 🎥 Vídeo de demonstração: *(https://youtu.be/MxHj0HpbGMI)*
 
 ---
 
